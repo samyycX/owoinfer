@@ -75,7 +75,7 @@ __nv_bfloat16* bf_mut(const Tensor& t) { return static_cast<__nv_bfloat16*>(t.da
 bool aligned256(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 256 == 0; }
 
 kq::Int8Operands operands(const std::int8_t* xq, std::int64_t ldx, const float* scale, const Int8Linear& w,
-                          std::int64_t m) {
+                          std::int64_t m, std::uint32_t* norm_bounds = nullptr) {
   kq::Int8Operands op;
   op.x_q = xq;
   op.ldx = ldx;
@@ -85,6 +85,7 @@ kq::Int8Operands operands(const std::int8_t* xq, std::int64_t ldx, const float* 
   op.m = m;
   op.n = w.w.dim(0);
   op.k = w.w.dim(1);
+  op.norm_bounds = norm_bounds;
   return op;
 }
 
@@ -285,6 +286,10 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   // The keys and values: the run's own rows, or with reference slots the run's key rows of the slotted region.
   const Tensor kv = slots == 0 ? qkv : rows_of(a.big, 0, l + 2 * slots, 3 * kD, run.k0, run.k1);
   float* scale = static_cast<float*>(qa.scale.data) + run.t0;
+  // Attention workspace is dead during QKV and FFN GEMMs. Volta can reuse eight bytes for its exact norm bound;
+  // other architectures ignore this optional scratch. No allocation, persistent cache or host synchronization.
+  auto* norm_bounds = a.lse_bytes >= 8 && reinterpret_cast<std::uintptr_t>(a.lse) % 8 == 0
+      ? static_cast<std::uint32_t*>(a.lse) : nullptr;
   // Quantized [L, kD] GEMM inputs (INT8, or packed INT4 in the first half): the qkv input in the attention output's
   // columns (free until attention runs), the o-proj and ffn_up_gate inputs in y (free while their GEMMs run: the
   // quantized paths never store the bf16 norm output). An INT4 linear with a LoRA side branch runs the INT8 LoRA GEMM
@@ -365,7 +370,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   } else if (!w.qkv8.empty()) {
     kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), xq_qkv, kD, scale,
                                           m, static_cast<int>(kD), stream);
-    kq::int8_gemm(operands(xq_qkv, kD, scale, w.qkv8, m), nullptr, bf_mut(qkv), 3 * kD, stream);
+    kq::int8_gemm(operands(xq_qkv, kD, scale, w.qkv8, m, norm_bounds), nullptr, bf_mut(qkv), 3 * kD, stream);
   } else {
     kernels::rms_norm_modulate_moss(x, w.norm1, vec(a.mod, 1), vec(a.mod, 0), y, stream);
     if (!w.qkv_split && s_qkv != nullptr) {
@@ -395,7 +400,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
         kq::rotate_quantize(bf(y), kD, xq_qkv, kD, scale, m, static_cast<int>(kD), stream);
         for (int i = 0; i < 3; ++i) {
           if (!w.qkv8_part[i].empty()) {
-            kq::int8_gemm(operands(xq_qkv, kD, scale, w.qkv8_part[i], m), nullptr, bf_mut(part(i)), 3 * kD, stream);
+            kq::int8_gemm(operands(xq_qkv, kD, scale, w.qkv8_part[i], m, norm_bounds), nullptr, bf_mut(part(i)), 3 * kD, stream);
           }
         }
       }
@@ -539,7 +544,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
     kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)), xq_y, kD, scale,
                                           m, static_cast<int>(kD), stream);
-    kq::int8_gemm_situ_glu(operands(xq_y, kD, scale, w.up_gate8, m), bf_mut(ffn), kF, stream);
+    kq::int8_gemm_situ_glu(operands(xq_y, kD, scale, w.up_gate8, m, norm_bounds), bf_mut(ffn), kF, stream);
   } else {
     kernels::rms_norm_modulate_moss(x, w.norm2, vec(a.mod, 4), vec(a.mod, 3), y, stream);
     if (s_up != nullptr) {

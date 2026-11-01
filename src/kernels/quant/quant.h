@@ -85,6 +85,10 @@ struct Int8Operands {
   const std::int8_t* w = nullptr;
   const float* w_scale = nullptr;
   std::int64_t m = 0, n = 0, k = 0;
+  // Optional caller scratch: two uint32 values, 8-byte aligned, disjoint from operands/output, owned by this
+  // stream until the GEMM finishes. Volta uses exact squared-norm bounds to select an exact fp32 fast path;
+  // nullptr retains integer folds. Other architectures ignore it. Contents are unspecified after the call.
+  std::uint32_t* norm_bounds = nullptr;
 };
 
 // out[m, n] = bf16((acc * x_scale[r]) * w_scale[c] + bias[c]), bias: bf16 [n] or nullptr. out: bf16, row stride ldo,

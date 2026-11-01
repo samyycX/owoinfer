@@ -56,6 +56,8 @@ void gemm(int m, int n, int k, int epilogue) {
   Buffer bias(static_cast<std::size_t>(n) * 2), gate(static_cast<std::size_t>(n) * 2);
   Buffer out(static_cast<std::size_t>(m) * n * 2);
   mi::kernels::quant::Int8Operands p{x.get<std::int8_t>(), k, xs.get<float>(), w.get<std::int8_t>(), ws.get<float>(), m, n, k};
+  Buffer bounds(2 * sizeof(std::uint32_t));
+  p.norm_bounds = bounds.get<std::uint32_t>();  // match the DiT caller; norm checks and the fallback launch are timed
   const float ms = time_ms([&] {
     if (epilogue == 2) mi::kernels::quant::int8_gemm_situ_glu(p, out.get<__nv_bfloat16>(), n / 2, nullptr);
     else if (epilogue == 1) mi::kernels::quant::int8_gemm_gated_residual(p, bias.get<__nv_bfloat16>(), gate.get<__nv_bfloat16>(),

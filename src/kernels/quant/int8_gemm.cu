@@ -66,6 +66,9 @@ Problem check_operands(const char* op, const Int8Operands& a) {
   if (!aligned16(a.x_q) || !aligned16(a.w) || !aligned16(a.w_scale)) {
     fail(op, "x_q, w and w_scale must be 16-byte aligned");
   }
+  if (a.norm_bounds != nullptr && reinterpret_cast<std::uintptr_t>(a.norm_bounds) % 8 != 0) {
+    fail(op, "norm_bounds must be 8-byte aligned");
+  }
   Problem p;
   p.m = static_cast<int>(a.m);
   p.n = static_cast<int>(a.n);

@@ -177,13 +177,45 @@ struct ExactMma : Base {
   }
 };
 
+// Each int8 row norm fits uint32 under kMaxInt8GemmK. Their product fits uint64. Cauchy-Schwarz bounds
+// every partial dot product, in any reduction order: max(sum(x*x)) * max(sum(w*w)) <= 2^48 guarantees
+// that all integer fp32 accumulators stay within [-2^24, 2^24]. Unsafe matrices retain the exact integer folds.
+__global__ void norm_bounds_kernel(quant::Int8Operands p, unsigned* bounds) {
+  __shared__ unsigned xs[8], ws[8];
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const std::int64_t row = std::int64_t(blockIdx.x) * 8 + warp;
+  int sum = 0;
+  if (row < p.m + p.n) {
+    const auto* source = row < p.m ? p.x_q + std::int64_t(row) * p.ldx : p.w + std::int64_t(row - p.m) * p.k;
+    const auto* packed = reinterpret_cast<const int*>(source);
+    for (int k = lane; k < p.k / 4; k += 32) {
+      const int v = packed[k];
+      sum = __dp4a(v, v, sum);
+    }
+  }
+  for (int d = 16; d > 0; d /= 2) sum += __shfl_down_sync(0xffffffffu, sum, d);
+  if (lane == 0) {
+    xs[warp] = row < p.m ? sum : 0;
+    ws[warp] = row >= p.m ? sum : 0;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    unsigned x = lane < 8 ? xs[lane] : 0, w = lane < 8 ? ws[lane] : 0;
+    for (int d = 16; d > 0; d /= 2) {
+      x = max(x, __shfl_down_sync(0xffffffffu, x, d));
+      w = max(w, __shfl_down_sync(0xffffffffu, w, d));
+    }
+    if (lane == 0) { atomicMax(bounds, x); atomicMax(bounds + 1, w); }
+  }
+}
+
 enum class Epilogue { kPlain, kResidual, kSitu };
 using qd::add;
 using qd::mul;
 using qd::rbf;
 using qd::dequant;
 
-template <Epilogue E, typename Tile>
+template <Epilogue E, typename Tile, bool Fast = false>
 struct Kernel {
   using Core = cutlass::gemm::threadblock::DefaultMmaCore<
       typename Tile::Threadblock, typename Tile::Warp, Sm70Instr, cutlass::half_t, qd::RowMajor,
@@ -195,26 +227,30 @@ struct Kernel {
   using IteratorB = cutlass::transform::threadblock::PredicatedTileIterator<
       cutlass::MatrixShape<Core::Shape::kK, Core::Shape::kN>, std::int8_t, qd::ColumnMajor, 0,
       typename Core::IteratorThreadMapB, 8, false, PermuteB>;
-  using Mma = ExactMma<cutlass::gemm::threadblock::MmaPipelined<
+  using BaseMma = cutlass::gemm::threadblock::MmaPipelined<
       typename Core::Shape, IteratorA, typename Core::SmemIteratorA, IteratorB, typename Core::SmemIteratorB,
-      float, qd::RowMajor, typename Core::MmaPolicy>>;
+      float, qd::RowMajor, typename Core::MmaPolicy>;
+  using Mma = std::conditional_t<Fast, BaseMma, ExactMma<BaseMma>>;
   using SharedStorage = typename Mma::SharedStorage;
 };
 
-template <Epilogue E, typename Tile>
-__global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E, Tile>::IteratorA::Params pa,
-                             typename Kernel<E, Tile>::IteratorB::Params pb, const __nv_bfloat16* bias,
+template <Epilogue E, typename Tile, bool Fast = false>
+__global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E, Tile, Fast>::IteratorA::Params pa,
+                             typename Kernel<E, Tile, Fast>::IteratorB::Params pb, const __nv_bfloat16* bias,
                              const __nv_bfloat16* gate, __nv_bfloat16* out, std::int64_t ldo,
-                             qd::SituFactorTables tables, int log_tile) {
-  using K = Kernel<E, Tile>;
+                             qd::SituFactorTables tables, int log_tile, const unsigned* bounds) {
+  using K = Kernel<E, Tile, Fast>;
   constexpr int BM = Tile::Threadblock::kM, BN = Tile::Threadblock::kN;
-  constexpr int kThreads = (BM / Tile::Warp::kM) * (BN / Tile::Warp::kN) * 32;
   extern __shared__ __align__(16) char buffer[];
   auto& storage = *reinterpret_cast<typename K::SharedStorage*>(buffer);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   const auto tile = qd::Swizzle::get_tile_offset(log_tile);
   const int m0 = tile.m() * BM, n0 = tile.n() * BN;
   if (m0 >= p.m || n0 >= p.n) return;
+  if (bounds) {
+    const bool safe = std::uint64_t(bounds[0]) * bounds[1] <= (std::uint64_t{1} << 48);
+    if (safe != Fast) return;
+  }
   typename K::IteratorA a(pa, const_cast<std::int8_t*>(p.x_q), {int(p.m), int(p.k)}, tid, {m0, 0});
   typename K::IteratorB b(pb, const_cast<std::int8_t*>(p.w), {int(p.k), int(p.n)}, tid, {0, n0});
   typename K::Mma mma(storage, tid, warp, lane);
@@ -224,17 +260,18 @@ __global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E, Tile>::Ite
 
   // CUTLASS's Volta FP32 accumulator is interleaved in 32x32 tiles. Each lane owns two rows and adjacent
   // column pairs per MMA. Decode that layout directly, avoiding a full float tile and two CTA barriers.
-  static_assert(Tile::Warp::kM == 32 && Tile::Warp::kN == 64 && K::Mma::FragmentC::kElements == 64);
+  constexpr int WM = Tile::Warp::kM, WN = Tile::Warp::kN;
+  static_assert(WM % 32 == 0 && WN % 32 == 0);
   static_assert(fused::detail::kUpGateGroup == 4);
   const int quad = lane >> 2;
-  const int r0 = m0 + (warp % (BM / 32)) * 32 + (((quad & 4) >> 1) + (quad & 1)) * 8 + (lane & 1);
-  const int c0 = (warp / (BM / 32)) * 64 + ((quad >> 1) & 1) * 8 + (lane & 2);
+  const int r0 = m0 + (warp % (BM / WM)) * WM + (((quad & 4) >> 1) + (quad & 1)) * 8 + (lane & 1);
+  const int c0 = (warp / (BM / WM)) * WN + ((quad >> 1) & 1) * 8 + (lane & 2);
   CUTLASS_PRAGMA_UNROLL
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i < K::Mma::FragmentC::kElements; ++i) {
     // Grouped up/gate columns are four apart: the matching gate is 16 registers after each hidden value.
     if constexpr (E == Epilogue::kSitu) { if (i & 16) continue; }
-    const int r = r0 + ((i >> 3) & 1) * 4 + ((i >> 1) & 1) * 2;
-    const int c = c0 + (i >> 5) * 32 + ((i >> 4) & 1) * 4 + ((i >> 2) & 1) * 16 + (i & 1);
+    const int r = r0 + ((i / 32) % (WM / 32)) * 32 + ((i >> 3) & 1) * 4 + ((i >> 1) & 1) * 2;
+    const int c = c0 + (i / 32 / (WM / 32)) * 32 + ((i >> 4) & 1) * 4 + ((i >> 2) & 1) * 16 + (i & 1);
     const int col = E == Epilogue::kSitu ? n0 / 2 + (c / 8) * 4 + c % 8 : n0 + c;
     if (r >= p.m || col >= (E == Epilogue::kSitu ? p.n / 2 : p.n)) continue;
     const float xs = p.x_scale[r];
@@ -254,23 +291,23 @@ __global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E, Tile>::Ite
   }
 }
 
-template <Epilogue E, typename Tile>
+template <Epilogue E, typename Tile, bool Fast = false>
 void launch_tile(const quant::Int8Operands& p, const __nv_bfloat16* bias, const __nv_bfloat16* gate,
-             __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
+             __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream, const unsigned* bounds = nullptr) {
   constexpr int kBM = Tile::Threadblock::kM, kBN = Tile::Threadblock::kN;
   constexpr int kThreads = (kBM / Tile::Warp::kM) * (kBN / Tile::Warp::kN) * 32;
   // Reuse the quantized kernels' eight-column CTA swizzle to improve L2 reuse of activation tiles.
   const cutlass::gemm::GemmCoord tiled((p.m + kBM - 1) / kBM, (p.n + kBN - 1) / kBN, 1);
   const dim3 grid = qd::Swizzle::get_grid_shape(tiled);
   const int log_tile = qd::Swizzle::get_log_tile(tiled);
-  const typename Kernel<E, Tile>::IteratorA::Params pa{qd::RowMajor(p.ldx)};
-  const typename Kernel<E, Tile>::IteratorB::Params pb{qd::ColumnMajor(p.k)};
+  const typename Kernel<E, Tile, Fast>::IteratorA::Params pa{qd::RowMajor(p.ldx)};
+  const typename Kernel<E, Tile, Fast>::IteratorB::Params pb{qd::ColumnMajor(p.k)};
   qd::SituFactorTables tables{};
   if constexpr (E == Epilogue::kSitu) tables = situ_tables(stream);
-  constexpr int bytes = sizeof(typename Kernel<E, Tile>::SharedStorage);
-  auto kernel = &int8_kernel<E, Tile>;
+  constexpr int bytes = sizeof(typename Kernel<E, Tile, Fast>::SharedStorage);
+  auto kernel = &int8_kernel<E, Tile, Fast>;
   if constexpr (bytes > 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-  kernel<<<grid, kThreads, bytes, stream>>>(p, pa, pb, bias, gate, out, ldo, tables, log_tile);
+  kernel<<<grid, kThreads, bytes, stream>>>(p, pa, pb, bias, gate, out, ldo, tables, log_tile, bounds);
   MI_CUDA_CHECK_LAUNCH();
 }
 
@@ -278,7 +315,24 @@ template <Epilogue E>
 void launch(const quant::Int8Operands& p, const __nv_bfloat16* bias, const __nv_bfloat16* gate,
              __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
   // More rows reuse each weight tile during DiT prefill; short text/boundary shapes retain the smaller tile.
-  if (p.m >= 1024) launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream);
+  if (p.m >= 1024) {
+    if constexpr (E == Epilogue::kPlain || E == Epilogue::kSitu) {
+      using FastTile = std::conditional_t<E == Epilogue::kSitu, qd::TileCfg<128, 256, 32, 64, 64, 2>,
+                                                                  qd::TileCfg<128, 128, 32, 64, 64, 2>>;
+      if (p.norm_bounds != nullptr) {
+        MI_CUDA_CHECK(cudaMemsetAsync(p.norm_bounds, 0, 2 * sizeof(std::uint32_t), stream));
+        norm_bounds_kernel<<<(p.m + p.n + 7) / 8, 256, 0, stream>>>(p, p.norm_bounds);
+        MI_CUDA_CHECK_LAUNCH();
+        // Exactly one kernel writes each output. The other exits before touching the residual/SiTU output.
+        launch_tile<E, FastTile, true>(p, bias, gate, out, ldo, stream, p.norm_bounds);
+        launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream, p.norm_bounds);
+      } else {
+        launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream);
+      }
+    } else {
+      launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream);
+    }
+  }
   else launch_tile<E, Sm70SmallTile>(p, bias, gate, out, ldo, stream);
 }
 

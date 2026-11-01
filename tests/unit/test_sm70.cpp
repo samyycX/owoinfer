@@ -53,7 +53,7 @@ class Buffer {
   std::size_t n_;
 };
 
-void check_gemm(int m, int n, int k, bool adversarial) {
+void check_gemm(int m, int n, int k, bool adversarial, bool bounded = false, bool saturated = false) {
   const int ldx = k + 16, ldo = n + 8;
   std::vector<std::int8_t> x(static_cast<std::size_t>(m) * ldx, 0), w(static_cast<std::size_t>(n) * k);
   std::uint32_t rng = 42;
@@ -64,13 +64,14 @@ void check_gemm(int m, int n, int k, bool adversarial) {
     return static_cast<std::int8_t>(static_cast<int>(rng % 256) - 128);
   };
   for (int r = 0; r < m; ++r) {
-    for (int d = 0; d < k; ++d) x[static_cast<std::size_t>(r) * ldx + d] = adversarial ? -128 : next();
+    for (int d = 0; d < k; ++d) x[static_cast<std::size_t>(r) * ldx + d] = saturated ? -128 : (adversarial ? 127 : next());
   }
   for (int c = 0; c < n; ++c) {
     for (int d = 0; d < k; ++d) {
       // Near-cancelling large positive/negative partial sums expose an unbounded fp32 accumulator's lost units.
       const int v = d < k / 2 ? 127 : -127;
-      w[static_cast<std::size_t>(c) * k + d] = adversarial ? static_cast<std::int8_t>(d == k - 1 ? c - 8 : v) : next();
+      w[static_cast<std::size_t>(c) * k + d] = saturated ? -128 :
+          (adversarial ? static_cast<std::int8_t>(d == k - 1 ? c - 8 : v) : next());
     }
   }
   std::vector<float> xs(static_cast<std::size_t>(m)), ws(static_cast<std::size_t>(n));
@@ -97,7 +98,9 @@ void check_gemm(int m, int n, int k, bool adversarial) {
   Buffer<std::int8_t> dx(x), dw(w);
   Buffer<float> dxs(xs), dws(ws);
   Buffer<std::uint16_t> db(bias), dg(gate), out(std::vector<std::uint16_t>(expected.size(), sentinel));
-  const mi::kernels::quant::Int8Operands p{dx.get(), ldx, dxs.get(), dw.get(), dws.get(), m, n, k};
+  Buffer<std::uint32_t> bounds(std::vector<std::uint32_t>(6, 0xdeadbeefu));
+  mi::kernels::quant::Int8Operands p{dx.get(), ldx, dxs.get(), dw.get(), dws.get(), m, n, k};
+  if (bounded) p.norm_bounds = bounds.get() + 2;
   const auto ptr = [](std::uint16_t* b) { return reinterpret_cast<__nv_bfloat16*>(b); };
   mi::kernels::quant::int8_gemm(p, ptr(db.get()), ptr(out.get()), ldo, nullptr);
   ASSERT_EQ(out.host(), expected);
@@ -134,6 +137,27 @@ void check_gemm(int m, int n, int k, bool adversarial) {
   cudaGraphExecDestroy(exec);
   cudaGraphDestroy(graph);
   cudaStreamDestroy(stream);
+  if (bounded) {
+    const auto row_max = [](const auto& values, int rows, int stride, int columns) {
+      std::uint32_t maximum = 0;
+      for (int r = 0; r < rows; ++r) {
+        std::uint32_t sum = 0;
+        for (int c = 0; c < columns; ++c) {
+          const int value = values[static_cast<std::size_t>(r) * stride + c];
+          sum += static_cast<std::uint32_t>(value * value);
+        }
+        maximum = std::max(maximum, sum);
+      }
+      return maximum;
+    };
+    const auto xn = row_max(x, m, ldx, k), wn = row_max(w, n, k, k);
+    EXPECT_EQ(bounds.host(), (std::vector<std::uint32_t>{0xdeadbeefu, 0xdeadbeefu, xn, wn, 0xdeadbeefu, 0xdeadbeefu}));
+    if (saturated) {
+      EXPECT_EQ(std::uint64_t(xn) * wn <= (std::uint64_t{1} << 48), k <= 1024);
+    }
+    p.norm_bounds = bounds.get() + 1;
+    EXPECT_THROW(mi::kernels::quant::int8_gemm(p, ptr(db.get()), ptr(out.get()), ldo, nullptr), std::invalid_argument);
+  }
 }
 
 }  // namespace
@@ -175,6 +199,14 @@ TEST(GpuSm70, Int8ExactLargeCancellation) {
   if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
   check_gemm(3, 16, 131056, true);
   check_gemm(1025, 8, 2064, true);  // large tile and a partial final integer fold
+}
+
+TEST(GpuSm70, Int8NormGuardAndFallback) {
+  if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
+  check_gemm(1025, 264, 1040, false, true);  // both fast tiles, row/column tails, SiTU pairing and Graph replay
+  check_gemm(1025, 8, 1024, false, true, true);  // bound exactly 2^48, still safe
+  check_gemm(1025, 8, 1040, false, true, true);  // first supported K above that bound
+  check_gemm(1025, 16, 4096, true, true);  // odd products lose fp32 integer units without the fallback
 }
 
 TEST(GpuSm70, AttentionStridesVarlenAndGraph) {

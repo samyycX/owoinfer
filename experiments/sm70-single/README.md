@@ -4,7 +4,7 @@ Baseline: `a1126dc`. GPU 0 only, Tesla V100-SXM2-32GB, CUDA 12.9.86, driver 580.
 GCC 14.2, Release, default clocks. Measurements: 2026-11-01/02. No approximate step cache, CFG truncation,
 lower-precision accumulation, or multi-GPU execution was enabled.
 
-## Retained implementation
+## First-stage implementation (`a8cc10c`)
 
 - Keep the INT8 GEMM load pipeline alive across exact 1024-product FP32-to-INT32 folds. A nested chunk loop
   avoids testing the fold boundary on every K tile.
@@ -84,3 +84,48 @@ The development workspace retains the ignored `build-tools/single-*.log`, `singl
 `build-sm70/validation/single-*.json`, `.npy`, and `.png` artifacts. `build-tools/validate-single.py` reproduces
 the paired generations using the local model cache and the separately saved baseline executable. No models or
 executables are committed. The paused attention and multi-GPU prototypes remain on their separate branches.
+
+## Second stage: exact norm-guarded GEMMs
+
+The INT8-to-FP16 converter already uses CUTLASS's packed PRMT conversion. The useful follow-up is to avoid
+integer folds only when an exact GPU-computed bound proves that FP32 accumulation cannot lose integer units.
+For `X = max_row sum(x*x)` and `W = max_row sum(w*w)`, `X * W <= 2^48` bounds every partial dot product by
+`2^24`, by Cauchy-Schwarz. Unsafe inputs keep the integer-fold kernel. No host decision or synchronization is
+needed: both kernels are launched in order and exactly one writes the result.
+
+The fast QKV tile is 128x128x32 with a 64x64 warp; up/gate uses 128x256x32 with the same warp. O/down retain
+the existing folded implementation. DiT supplies eight bytes of its inactive attention workspace through the
+optional `Int8Operands::norm_bounds`; callers without scratch retain the existing path. No persistent allocation
+or weight-pointer cache is introduced. Boundary tests cover equality at `2^48`, overflow of that bound, odd-product
+cancellation, strided tails, scratch canaries, SiTU pairing, and CUDA Graph replay.
+
+The instrumented apple/seed-42 1024²/20-step run sampled 3360 DiT GEMMs; all passed even the whole-matrix bound.
+The largest square-root bounds were 5,956,317 (QKV), 5,404,664 (O), 5,902,101 (up/gate), and 13,795,929 (down),
+below 16,777,216. This is an observed workload result, not an assumption made by the production kernel.
+
+| Probe, ms | QKV | O | Up/gate | Down |
+|---|---:|---:|---:|---:|
+| Unguarded 64x64 warp, 128x128 CTA | 6.294 | 2.608 | 9.685 | 4.906 |
+| Unguarded 64x64 warp, 128x256 CTA | 6.355 | 2.670 | 8.951 | 5.033 |
+| Guarded selected tiles, including norm pass | 6.419 | 2.439 | 9.218 | 5.248 |
+| cuBLASLt FP16 input / FP32 output | 4.727 | 1.579 | 8.201 | 3.895 |
+
+The cuBLAS figures exclude conversion, dequantization and fused epilogues and therefore are only a ceiling probe,
+not a replacement with measured end-to-end benefit. Unguarded probes do not satisfy the generic numerical contract.
+The guarded prototype completed 20 apple steps in **31.99 s (~1.60 s/step)**; its final FP32 latent and decoded PNG
+matched the baseline exactly. The integrated caller-workspace version builds and passes all 10 SM70/build/conversion
+tests; full integrated-generation and sanitizer validation are still pending at this checkpoint.
+
+Probe sources and generation/build helpers are retained here. With the configured `build-sm70` directory:
+
+```sh
+python3 experiments/sm70-single/make_nofold.py
+python3 experiments/sm70-single/make_guarded.py
+python3 experiments/sm70-single/make_norm_probe.py
+python3 experiments/sm70-single/build_gemm_probe.py gemm-guarded
+python3 experiments/sm70-single/build_probe.py experiments/sm70-single/cublas_ceiling.cu
+```
+
+Generators intentionally read the first-stage source from `a8cc10c`. Generated sources and executables live in
+ignored `build-tools/`. `norm_probe.cuh` synchronizes and logs for measurement; `norm_guard_probe.cuh` has a
+single-device scratch allocation for prototyping. Neither is included by the production implementation.
