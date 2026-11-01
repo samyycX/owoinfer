@@ -1,4 +1,4 @@
-// Host references for Volta's integer Tensor Core path, including sums above fp32's exact-integer range.
+// Host references for Volta kernels, including attention layouts and sums above fp32's exact-integer range.
 #include <gtest/gtest.h>
 
 #include <cuda_bf16.h>
@@ -13,6 +13,7 @@
 
 #include "backend/probe.h"
 #include "core/cuda_check.h"
+#include "kernels/attention/flash_attention.h"
 #include "kernels/basic/elementwise.h"
 #include "kernels/sm70/sm70.h"
 #include "kernels/sm70/vae_sm70.h"
@@ -167,11 +168,121 @@ TEST(GpuSm70, Int8EpiloguesAndStrides) {
   check_gemm(67, 136, 1040, false);
   check_gemm(129, 256, 4096, false);
   check_gemm(1025, 136, 1040, false);
+  check_gemm(1025, 1032, 48, false);  // row/column tails across an eight-column CTA swizzle group
 }
 
 TEST(GpuSm70, Int8ExactLargeCancellation) {
   if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
   check_gemm(3, 16, 131056, true);
+  check_gemm(1025, 8, 2064, true);  // large tile and a partial final integer fold
+}
+
+TEST(GpuSm70, AttentionStridesVarlenAndGraph) {
+  if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
+  constexpr int heads = 4, kv_heads = 2, dim = 128, head_stride = dim + 8;
+  constexpr int q_stride = heads * head_stride + 8, k_stride = kv_heads * head_stride + 8;
+  const std::vector<int> cq{0, 1105, 1298, 1299}, ck{0, 1073, 1138, 1138};
+  const int total_q = cq.back(), total_k = ck.back();
+  std::uint32_t rng = 47;
+  const auto values = [&](std::size_t count) {
+    std::vector<std::uint16_t> v(count);
+    for (auto& value : v) {
+      rng ^= rng << 13;
+      rng ^= rng >> 17;
+      rng ^= rng << 5;
+      value = bf16(static_cast<float>(static_cast<int>(rng % 65536) - 32768) * (0.7f / 32768.f));
+    }
+    return v;
+  };
+  const auto hq = values(static_cast<std::size_t>(total_q) * q_stride);
+  const auto hk = values(static_cast<std::size_t>(total_k) * k_stride), hv = values(hk.size());
+  const auto sentinel = bf16(-123.f);
+  Buffer<std::uint16_t> dq(hq), dk(hk), dv(hv);
+  Buffer<std::uint16_t> dout(std::vector<std::uint16_t>(hq.size(), sentinel));
+  Buffer<int> dcq(cq), dck(ck);
+  Buffer<float> lse(std::vector<float>(static_cast<std::size_t>(total_q) * heads));
+  const auto view = [&](std::uint16_t* ptr, int tokens, int nh, int stride) {
+    Tensor t = Tensor::view(ptr, DType::kBF16, Device::kCUDA, {tokens, nh, dim});
+    t.stride[0] = stride;
+    t.stride[1] = head_stride;
+    return t;
+  };
+  const auto q = view(dq.get(), total_q, heads, q_stride), o = view(dout.get(), total_q, heads, q_stride);
+  const auto k = view(dk.get(), total_k, kv_heads, k_stride), v = view(dv.get(), total_k, kv_heads, k_stride);
+  const auto cuq = Tensor::view(dcq.get(), DType::kI32, Device::kCUDA, {4});
+  const auto cuk = Tensor::view(dck.get(), DType::kI32, Device::kCUDA, {4});
+  const float scale = 1.f / std::sqrt(static_cast<float>(dim));
+  const auto run = [&](cudaStream_t stream) {
+    mi::attention::flash_fwd(q, k, v, o, cuq, cuk, 1105, false, scale, lse.get(),
+                              mi::attention::flash_fwd_workspace_bytes(total_q, heads), stream);
+  };
+  run(nullptr);
+  const auto first = dout.host();
+  cudaStream_t stream = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  MI_CUDA_CHECK(cudaStreamCreate(&stream));
+  MI_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  run(stream);
+  MI_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+  MI_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  for (int i = 0; i < 2; ++i) MI_CUDA_CHECK(cudaGraphLaunch(exec, stream));
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+  cudaGraphExecDestroy(exec);
+  cudaGraphDestroy(graph);
+  cudaStreamDestroy(stream);
+  const auto actual = dout.host();
+  const auto actual_lse = lse.host();
+  EXPECT_EQ(actual, first);
+  EXPECT_EQ(dq.host(), hq);
+  EXPECT_EQ(dk.host(), hk);
+  EXPECT_EQ(dv.host(), hv);
+  for (int row = 0; row < total_q; ++row) for (int d = 0; d < q_stride; ++d) {
+    const auto value = actual[static_cast<std::size_t>(row) * q_stride + d];
+    if (d >= heads * head_stride || d % head_stride >= dim) EXPECT_EQ(value, sentinel);
+    else ASSERT_TRUE(std::isfinite(f32(value)));
+  }
+  // FP64 softmax/PV reference at row, warp and CTA boundaries; unlike the GPU, this never narrows probabilities.
+  double squared_error = 0., squared_reference = 0., max_error = 0.;
+  for (int row : {0, 1, 2, 3, 15, 16, 31, 32, 63, 64, 127, 128, 191, 192, 383, 384, 1023, 1024, 1104, 1105, 1297, 1298}) {
+    const int batch = static_cast<int>(std::upper_bound(cq.begin(), cq.end(), row) - cq.begin()) - 1;
+    for (int head = 0; head < heads; ++head) {
+      const auto qo = static_cast<std::size_t>(row) * q_stride + head * head_stride;
+      const auto li = static_cast<std::size_t>(head) * total_q + row;
+      if (ck[batch] == ck[batch + 1]) {
+        EXPECT_EQ(actual_lse[li], INFINITY);
+        for (int d = 0; d < dim; ++d) EXPECT_EQ(f32(actual[qo + d]), 0.f);
+        continue;
+      }
+      const int kh = head / (heads / kv_heads), length = ck[batch + 1] - ck[batch];
+      std::vector<double> probabilities(static_cast<std::size_t>(length));
+      double maximum = -INFINITY;
+      for (int j = 0; j < length; ++j) {
+        double dot = 0.;
+        const auto ko = static_cast<std::size_t>(ck[batch] + j) * k_stride + kh * head_stride;
+        for (int d = 0; d < dim; ++d) dot += static_cast<double>(f32(hq[qo + d])) * f32(hk[ko + d]);
+        probabilities[static_cast<std::size_t>(j)] = dot * scale;
+        maximum = std::max(maximum, dot * scale);
+      }
+      double sum = 0.;
+      for (double& probability : probabilities) { probability = std::exp(probability - maximum); sum += probability; }
+      EXPECT_NEAR(actual_lse[li], maximum + std::log(sum), 2e-5);
+      for (int d = 0; d < dim; ++d) {
+        double expected = 0.;
+        for (int j = 0; j < length; ++j) {
+          const auto vi = static_cast<std::size_t>(ck[batch] + j) * k_stride + kh * head_stride + d;
+          expected += probabilities[static_cast<std::size_t>(j)] * f32(hv[vi]);
+        }
+        expected /= sum;
+        const double error = f32(actual[qo + d]) - expected;
+        squared_error += error * error;
+        squared_reference += expected * expected;
+        max_error = std::max(max_error, std::abs(error));
+      }
+    }
+  }
+  EXPECT_LT(std::sqrt(squared_error / squared_reference), 0.0035);
+  EXPECT_LT(max_error, 0.002);
 }
 
 #if MOSSINFER_HAVE_SM70

@@ -1,3 +1,33 @@
+/***************************************************************************************************
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
 // Volta INT8 ConvRot GEMMs: fp16 tensor-core partials, exact int32 sums and the existing quant epilogues.
 #include "kernels/sm70/sm70.h"
 
@@ -82,28 +112,65 @@ struct ExactMma : Base {
   using typename Base::IteratorA;
   using typename Base::IteratorB;
   using typename Base::SharedStorage;
-  SharedStorage& storage;
-  int thread, warp, lane;
-  CUTLASS_DEVICE ExactMma(SharedStorage& s, int t, int w, int l)
-      : Base(s, t, w, l), storage(s), thread(t), warp(w), lane(l) {}
+  CUTLASS_DEVICE ExactMma(SharedStorage& s, int t, int w, int l) : Base(s, t, w, l) {}
 
   CUTLASS_DEVICE void operator()(int iterations, FragmentC& accum, IteratorA a, IteratorB b, const FragmentC& src) {
+    this->prologue(a, b, iterations);
+    this->gmem_wait();
+    typename Base::Operator::FragmentA wa[2];
+    typename Base::Operator::FragmentB wb[2];
+    this->warp_tile_iterator_A_.set_kgroup_index(0);
+    this->warp_tile_iterator_B_.set_kgroup_index(0);
+    this->warp_tile_iterator_A_.load(wa[0]);
+    this->warp_tile_iterator_B_.load(wb[0]);
+    ++this->warp_tile_iterator_A_;
+    ++this->warp_tile_iterator_B_;
+    typename Base::FragmentA ta;
+    typename Base::FragmentB tb;
+    a.clear_mask(iterations <= 1);
+    b.clear_mask(iterations <= 1);
+    FragmentC partial;
+    partial.clear();
     cutlass::Array<int, FragmentC::kElements> sums;
     sums.clear();
-    constexpr int kIterations = 1024 / Base::Shape::kK;
-    for (int start = 0; start < iterations; start += kIterations) {
-      FragmentC partial, zero;
-      zero.clear();
-      Base mma(storage, thread, warp, lane);
-      mma(min(kIterations, iterations - start), partial, a, b, zero);
+    static_assert(1024 % Base::Shape::kK == 0 && Base::Policy::kPartitionsK == 1);
+    constexpr int kFold = 1024 / Base::Shape::kK;
+    constexpr int kWarpIterations = Base::kWarpGemmIterations;
+    // Fold only at the chunk boundary; both shared-memory stages and the prefetched warp fragments stay live.
+    while (iterations > 0) {
+      const int chunk = min(kFold, iterations);
+      CUTLASS_GEMM_LOOP
+      for (int inner = 0; inner < chunk; ++inner, --iterations) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < kWarpIterations; ++k) {
+          if (k == kWarpIterations - 1) {
+            this->smem_iterator_A_.store(this->transform_A_(ta));
+            this->smem_iterator_B_.store(this->transform_B_(tb));
+            this->gmem_wait();
+            this->advance_smem_stages();
+          }
+          this->warp_tile_iterator_A_.set_kgroup_index((k + 1) % kWarpIterations);
+          this->warp_tile_iterator_B_.set_kgroup_index((k + 1) % kWarpIterations);
+          this->warp_tile_iterator_A_.load(wa[(k + 1) % 2]);
+          this->warp_tile_iterator_B_.load(wb[(k + 1) % 2]);
+          ++this->warp_tile_iterator_A_;
+          ++this->warp_tile_iterator_B_;
+          if (k == 0) {
+            ta.clear();
+            tb.clear();
+            a.load(ta);
+            b.load(tb);
+            ++a;
+            ++b;
+            a.clear_mask(iterations <= 2);
+            b.clear_mask(iterations <= 2);
+          }
+          this->warp_mma(partial, wa[k % 2], wb[k % 2], partial);
+        }
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < FragmentC::kElements; ++i) sums[i] += __float2int_rn(partial[i]);
-      __syncthreads();
-      CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < kIterations; ++j) {
-        ++a;
-        ++b;
-      }
+      partial.clear();
     }
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < FragmentC::kElements; ++i) accum[i] = __int2float_rn(sums[i]) + src[i];
@@ -131,53 +198,54 @@ struct Kernel {
   using Mma = ExactMma<cutlass::gemm::threadblock::MmaPipelined<
       typename Core::Shape, IteratorA, typename Core::SmemIteratorA, IteratorB, typename Core::SmemIteratorB,
       float, qd::RowMajor, typename Core::MmaPolicy>>;
-  union SharedStorage {
-    typename Mma::SharedStorage mainloop;
-    float result[Tile::Threadblock::kM * Tile::Threadblock::kN];
-  };
+  using SharedStorage = typename Mma::SharedStorage;
 };
 
 template <Epilogue E, typename Tile>
 __global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E, Tile>::IteratorA::Params pa,
                              typename Kernel<E, Tile>::IteratorB::Params pb, const __nv_bfloat16* bias,
                              const __nv_bfloat16* gate, __nv_bfloat16* out, std::int64_t ldo,
-                             qd::SituFactorTables tables) {
+                             qd::SituFactorTables tables, int log_tile) {
   using K = Kernel<E, Tile>;
   constexpr int BM = Tile::Threadblock::kM, BN = Tile::Threadblock::kN;
   constexpr int kThreads = (BM / Tile::Warp::kM) * (BN / Tile::Warp::kN) * 32;
   extern __shared__ __align__(16) char buffer[];
   auto& storage = *reinterpret_cast<typename K::SharedStorage*>(buffer);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-  const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+  const auto tile = qd::Swizzle::get_tile_offset(log_tile);
+  const int m0 = tile.m() * BM, n0 = tile.n() * BN;
+  if (m0 >= p.m || n0 >= p.n) return;
   typename K::IteratorA a(pa, const_cast<std::int8_t*>(p.x_q), {int(p.m), int(p.k)}, tid, {m0, 0});
   typename K::IteratorB b(pb, const_cast<std::int8_t*>(p.w), {int(p.k), int(p.n)}, tid, {0, n0});
-  typename K::Mma mma(storage.mainloop, tid, warp, lane);
+  typename K::Mma mma(storage, tid, warp, lane);
   typename K::Mma::FragmentC accum, zero;
   zero.clear();
   mma((p.k + Tile::Threadblock::kK - 1) / Tile::Threadblock::kK, accum, a, b, zero);
-  __syncthreads();
-  using IteratorC = typename K::Core::MmaTensorOp::IteratorC;
-  IteratorC c({storage.result, qd::RowMajor(BN)}, lane);
-  c.add_tile_offset({warp % (BM / Tile::Warp::kM), warp / (BM / Tile::Warp::kM)});
-  c.store(accum);
-  __syncthreads();
-  const float* result = storage.result;
-  constexpr int kOutN = E == Epilogue::kSitu ? BN / 2 : BN;
-  for (int i = tid; i < BM * kOutN; i += kThreads) {
-    const int row = i / kOutN, c = i % kOutN;
-    const int r = m0 + row, col = (E == Epilogue::kSitu ? n0 / 2 : n0) + c;
+
+  // CUTLASS's Volta FP32 accumulator is interleaved in 32x32 tiles. Each lane owns two rows and adjacent
+  // column pairs per MMA. Decode that layout directly, avoiding a full float tile and two CTA barriers.
+  static_assert(Tile::Warp::kM == 32 && Tile::Warp::kN == 64 && K::Mma::FragmentC::kElements == 64);
+  static_assert(fused::detail::kUpGateGroup == 4);
+  const int quad = lane >> 2;
+  const int r0 = m0 + (warp % (BM / 32)) * 32 + (((quad & 4) >> 1) + (quad & 1)) * 8 + (lane & 1);
+  const int c0 = (warp / (BM / 32)) * 64 + ((quad >> 1) & 1) * 8 + (lane & 2);
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < 64; ++i) {
+    // Grouped up/gate columns are four apart: the matching gate is 16 registers after each hidden value.
+    if constexpr (E == Epilogue::kSitu) { if (i & 16) continue; }
+    const int r = r0 + ((i >> 3) & 1) * 4 + ((i >> 1) & 1) * 2;
+    const int c = c0 + (i >> 5) * 32 + ((i >> 4) & 1) * 4 + ((i >> 2) & 1) * 16 + (i & 1);
+    const int col = E == Epilogue::kSitu ? n0 / 2 + (c / 8) * 4 + c % 8 : n0 + c;
     if (r >= p.m || col >= (E == Epilogue::kSitu ? p.n / 2 : p.n)) continue;
     const float xs = p.x_scale[r];
     float value;
     if constexpr (E == Epilogue::kSitu) {
-      constexpr int g = fused::detail::kUpGateGroup;
-      const int hc = (c / g) * (2 * g) + c % g;
-      const float h = rbf(dequant(result[row * BN + hc], xs, p.w_scale[col], 0.f));
-      const float gt = rbf(dequant(result[row * BN + hc + g], xs, p.w_scale[col + p.n / 2], 0.f));
-      value = qd::mul(qd::bf16_entry(tables.hidden, qd::bf16_index(h)),
-                      qd::bf16_entry(tables.gate, qd::bf16_index(gt)));
+      const float h = rbf(dequant(accum[i], xs, p.w_scale[col], 0.f));
+      const float gt = rbf(dequant(accum[i + 16], xs, p.w_scale[col + p.n / 2], 0.f));
+      value = mul(qd::bf16_entry(tables.hidden, qd::bf16_index(h)),
+                  qd::bf16_entry(tables.gate, qd::bf16_index(gt)));
     } else {
-      value = dequant(result[row * BN + c], xs, p.w_scale[col], bias ? __bfloat162float(bias[col]) : 0.f);
+      value = dequant(accum[i], xs, p.w_scale[col], bias ? __bfloat162float(bias[col]) : 0.f);
       if constexpr (E == Epilogue::kResidual) {
         value = add(__bfloat162float(out[r * ldo + col]), rbf(mul(rbf(value), __bfloat162float(gate[col]))));
       }
@@ -191,7 +259,10 @@ void launch_tile(const quant::Int8Operands& p, const __nv_bfloat16* bias, const 
              __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
   constexpr int kBM = Tile::Threadblock::kM, kBN = Tile::Threadblock::kN;
   constexpr int kThreads = (kBM / Tile::Warp::kM) * (kBN / Tile::Warp::kN) * 32;
-  const dim3 grid(static_cast<unsigned>((p.m + kBM - 1) / kBM), static_cast<unsigned>((p.n + kBN - 1) / kBN));
+  // Reuse the quantized kernels' eight-column CTA swizzle to improve L2 reuse of activation tiles.
+  const cutlass::gemm::GemmCoord tiled((p.m + kBM - 1) / kBM, (p.n + kBN - 1) / kBN, 1);
+  const dim3 grid = qd::Swizzle::get_grid_shape(tiled);
+  const int log_tile = qd::Swizzle::get_log_tile(tiled);
   const typename Kernel<E, Tile>::IteratorA::Params pa{qd::RowMajor(p.ldx)};
   const typename Kernel<E, Tile>::IteratorB::Params pb{qd::ColumnMajor(p.k)};
   qd::SituFactorTables tables{};
@@ -199,7 +270,7 @@ void launch_tile(const quant::Int8Operands& p, const __nv_bfloat16* bias, const 
   constexpr int bytes = sizeof(typename Kernel<E, Tile>::SharedStorage);
   auto kernel = &int8_kernel<E, Tile>;
   if constexpr (bytes > 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-  kernel<<<grid, kThreads, bytes, stream>>>(p, pa, pb, bias, gate, out, ldo, tables);
+  kernel<<<grid, kThreads, bytes, stream>>>(p, pa, pb, bias, gate, out, ldo, tables, log_tile);
   MI_CUDA_CHECK_LAUNCH();
 }
 

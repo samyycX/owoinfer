@@ -1,7 +1,8 @@
 // Exact varlen/GQA attention on Volta: fp16 WMMA with fp32 scores, online softmax and accumulation. Q/K/V stay
 // bf16 in global memory; only shared-memory tiles are converted. No quadratic score buffer or hidden allocation.
 // A warp owns 16 query rows. The sm_70 accumulator row groups use lane XOR 2/8 (unlike Turing's XOR 1/2);
-// coordinates are loaded through WMMA itself, so output stores follow its fragment layout.
+// coordinates are loaded through WMMA itself, so output stores follow its fragment layout. D=128 keeps the
+// softmax tile in registers and shuffles it into the next MMA input; D=256 retains its shared-memory path.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -35,6 +36,40 @@ struct Params {
   bool causal = false;
 };
 
+// SparkAttention's warp layout transform, adapted to Volta's 16x16 WMMA fragments (FP32 accumulators).
+// C gives a lane two rows and four columns; A needs one complete row, duplicated across lane bit 3.
+// Pack adjacent columns, exchange row pieces with XOR 2, then collect the two column halves with XOR 8.
+// The fp32 softmax and fp16 input rounding are unchanged. See arxiv.org/html/2502.12784v1#S3.SS2.SSS2.
+template <class Acc, class A>
+__device__ __forceinline__ A probability_fragment(const Acc& s, int lane) {
+  static_assert(Acc::num_elements == 8 && A::num_elements == 16);
+  union Packed { __half2 h; unsigned u; };
+  Packed p0, p2, p4, p6;
+  p0.h = __floats2half2_rn(s.x[0], s.x[1]);
+  p2.h = __floats2half2_rn(s.x[2], s.x[3]);
+  p4.h = __floats2half2_rn(s.x[4], s.x[5]);
+  p6.h = __floats2half2_rn(s.x[6], s.x[7]);
+  const bool second = (lane & 2) != 0;
+  const unsigned own0 = second ? p2.u : p0.u, own4 = second ? p6.u : p4.u;
+  const unsigned peer0 = __shfl_xor_sync(0xffffffffu, second ? p0.u : p2.u, 2);
+  const unsigned peer4 = __shfl_xor_sync(0xffffffffu, second ? p4.u : p6.u, 2);
+  const unsigned pairs[4] = {second ? peer0 : own0, second ? own0 : peer0,
+                              second ? peer4 : own4, second ? own4 : peer4};
+  A a;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const unsigned other = __shfl_xor_sync(0xffffffffu, pairs[i], 8);
+    Packed lo, hi;
+    lo.u = (lane & 8) ? other : pairs[i];
+    hi.u = (lane & 8) ? pairs[i] : other;
+    a.x[2 * i] = __low2half(lo.h);
+    a.x[2 * i + 1] = __high2half(lo.h);
+    a.x[2 * i + 8] = __low2half(hi.h);
+    a.x[2 * i + 9] = __high2half(hi.h);
+  }
+  return a;
+}
+
 template <int D, int BN, int kBM>
 __global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
   constexpr int kThreads = kBM * 2;
@@ -56,8 +91,8 @@ __global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
   const int rows = min(kBM, len_q - row_base);
   const int kv_head = head / (p.heads / p.kv_heads), shift = len_k - len_q;
 
-  // ps is scratch until the first P tile. Encode coordinates into an accumulator fragment once.
-  float* coords = reinterpret_cast<float*>(ps);
+  // K/V have not been loaded yet. Encode coordinates into an accumulator fragment once.
+  float* coords = reinterpret_cast<float*>(D == 128 ? vt : ps);
   for (int i = tid; i < 256; i += kThreads) coords[i] = static_cast<float>(i);
   __syncthreads();
   Acc positions;
@@ -101,59 +136,65 @@ __global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
         wmma::mma_sync(s[j], a, b, s[j]);
       }
     }
-    float mx[2] = {-1e30f, -1e30f};
+    // Keep 32-key online softmax updates even when staging 64 keys: changing this grouping changes rounding.
 #pragma unroll
-    for (int j = 0; j < BN / 16; ++j) {
+    for (int part = 0; part < BN / 32; ++part) {
+      float mx[2] = {-1e30f, -1e30f};
 #pragma unroll
-      for (int e = 0; e < Acc::num_elements; ++e) {
-        const int key = j0 + j * 16 + cc[e], row = row_base + warp * 16 + rr[e];
-        float value = s[j].x[e] * p.scale;
-        if (key >= len_k || (p.causal && key > row + shift)) value = -1e30f;
-        s[j].x[e] = value;
-        mx[(e & 2) / 2] = fmaxf(mx[(e & 2) / 2], value);
+      for (int j = part * 2; j < part * 2 + 2; ++j) {
+#pragma unroll
+        for (int e = 0; e < Acc::num_elements; ++e) {
+          const int key = j0 + j * 16 + cc[e], row = row_base + warp * 16 + rr[e];
+          float value = s[j].x[e] * p.scale;
+          if (key >= len_k || (p.causal && key > row + shift)) value = -1e30f;
+          s[j].x[e] = value;
+          mx[(e & 2) / 2] = fmaxf(mx[(e & 2) / 2], value);
+        }
       }
-    }
-    float alpha[2];
+      float alpha[2];
 #pragma unroll
-    for (int r = 0; r < 2; ++r) {
-      mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
-      mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 8));
-      mx[r] = fmaxf(mx[r], m[r]);
-      alpha[r] = m[r] <= -1e29f ? 0.f : exp2f((m[r] - mx[r]) * kLog2e);
-      m[r] = mx[r];
-    }
-    float sum[2] = {0.f, 0.f};
-#pragma unroll
-    for (int j = 0; j < BN / 16; ++j) {
-#pragma unroll
-      for (int e = 0; e < Acc::num_elements; ++e) {
-        const int r = (e & 2) / 2;
-        const float value = s[j].x[e] <= -1e29f ? 0.f : exp2f((s[j].x[e] - m[r]) * kLog2e);
-        sum[r] += value;
-        ps[(warp * 16 + rr[e]) * kVStride + j * 16 + cc[e]] = __float2half_rn(value);
+      for (int r = 0; r < 2; ++r) {
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 8));
+        mx[r] = fmaxf(mx[r], m[r]);
+        alpha[r] = m[r] <= -1e29f ? 0.f : exp2f((m[r] - mx[r]) * kLog2e);
+        m[r] = mx[r];
       }
-    }
+      float sum[2] = {0.f, 0.f};
 #pragma unroll
-    for (int r = 0; r < 2; ++r) {
-      sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 2);
-      sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 8);
-      l[r] = l[r] * alpha[r] + sum[r];
-    }
+      for (int j = part * 2; j < part * 2 + 2; ++j) {
 #pragma unroll
-    for (int d = 0; d < D / 16; ++d) {
+        for (int e = 0; e < Acc::num_elements; ++e) {
+          const int r = (e & 2) / 2;
+          const float value = s[j].x[e] <= -1e29f ? 0.f : exp2f((s[j].x[e] - m[r]) * kLog2e);
+          sum[r] += value;
+          if constexpr (D == 128) s[j].x[e] = value;
+          else ps[(warp * 16 + rr[e]) * kVStride + j * 16 + cc[e]] = __float2half_rn(value);
+        }
+      }
 #pragma unroll
-      for (int e = 0; e < Acc::num_elements; ++e) o[d].x[e] *= alpha[(e & 2) / 2];
-    }
-    __syncwarp();  // this warp alone writes and reads its P rows
-#pragma unroll
-    for (int j = 0; j < BN; j += 16) {
-      A a;
-      wmma::load_matrix_sync(a, ps + warp * 16 * kVStride + j, kVStride);
+      for (int r = 0; r < 2; ++r) {
+        sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 2);
+        sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 8);
+        l[r] = l[r] * alpha[r] + sum[r];
+      }
 #pragma unroll
       for (int d = 0; d < D / 16; ++d) {
-        B b;
-        wmma::load_matrix_sync(b, vt + d * 16 * kVStride + j, kVStride);
-        wmma::mma_sync(o[d], a, b, o[d]);
+#pragma unroll
+        for (int e = 0; e < Acc::num_elements; ++e) o[d].x[e] *= alpha[(e & 2) / 2];
+      }
+      if constexpr (D != 128) __syncwarp();  // only this warp reads/writes its P rows
+#pragma unroll
+      for (int j = part * 32; j < part * 32 + 32; j += 16) {
+        A a;
+        if constexpr (D == 128) a = probability_fragment<Acc, A>(s[j / 16], tid % 32);
+        else wmma::load_matrix_sync(a, ps + warp * 16 * kVStride + j, kVStride);
+#pragma unroll
+        for (int d = 0; d < D / 16; ++d) {
+          B b;
+          wmma::load_matrix_sync(b, vt + d * 16 * kVStride + j, kVStride);
+          wmma::mma_sync(o[d], a, b, o[d]);
+        }
       }
     }
     __syncthreads();
@@ -176,7 +217,7 @@ __global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
 template <int D, int BN, int kBM>
 void launch(const Params& p, int max_seqlen, int batch, cudaStream_t stream) {
   constexpr int kThreads = kBM * 2;
-  constexpr int bytes = ((kBM + BN) * (D + 8) + (D + kBM) * (BN + 8)) * sizeof(__half);
+  constexpr int bytes = ((kBM + BN) * (D + 8) + (D + (D == 128 ? 0 : kBM)) * (BN + 8)) * sizeof(__half);
   static_assert(bytes <= 96 * 1024);
   auto kernel = &attention_kernel<D, BN, kBM>;
   if constexpr (bytes > 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
@@ -232,7 +273,7 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   const int batch = static_cast<int>(cu_seqlens_q.dim(0) - 1);
 
   if (head_dim == 128) {
-    if (max_seqlen >= 1024) launch<128, 32, 192>(p, max_seqlen, batch, stream);
+    if (max_seqlen >= 1024) launch<128, 64, 192>(p, max_seqlen, batch, stream);
     else launch<128, 32, 128>(p, max_seqlen, batch, stream);
   } else {
     launch<256, 32, 64>(p, max_seqlen, batch, stream);
