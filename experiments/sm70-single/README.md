@@ -85,7 +85,7 @@ The development workspace retains the ignored `build-tools/single-*.log`, `singl
 the paired generations using the local model cache and the separately saved baseline executable. No models or
 executables are committed. The paused attention and multi-GPU prototypes remain on their separate branches.
 
-## Second stage: exact norm-guarded GEMMs
+## Second stage: exact norm-guarded GEMMs (`8c21627`)
 
 The INT8-to-FP16 converter already uses CUTLASS's packed PRMT conversion. The useful follow-up is to avoid
 integer folds only when an exact GPU-computed bound proves that FP32 accumulation cannot lose integer units.
@@ -113,8 +113,26 @@ below 16,777,216. This is an observed workload result, not an assumption made by
 The cuBLAS figures exclude conversion, dequantization and fused epilogues and therefore are only a ceiling probe,
 not a replacement with measured end-to-end benefit. Unguarded probes do not satisfy the generic numerical contract.
 The guarded prototype completed 20 apple steps in **31.99 s (~1.60 s/step)**; its final FP32 latent and decoded PNG
-matched the baseline exactly. The integrated caller-workspace version builds and passes all 10 SM70/build/conversion
-tests; full integrated-generation and sanitizer validation are still pending at this checkpoint.
+matched the baseline exactly. The integrated caller-workspace version reproduced that result:
+
+| Prompt / seed / mode | Size / steps | Baseline denoise | Guarded denoise | Guarded mean step |
+|---|---|---:|---:|---:|
+| Apple / 42 / `max_speed` | 1024² / 20 | 37.7679 s | 32.0059 s | 1.6003 s |
+| Coastal city / 7 / `max_speed` | 1024² / 20 | 37.9839 s | 32.1140 s | 1.6057 s |
+| Green cup / 123 / `min_memory` | 256² / 3 | 1.12913 s | 1.13068 s | 0.3769 s |
+
+All three final FP32 latents are byte-identical to the saved baseline, and all decoded RGB pixels are identical.
+The two large cases reduce denoise time by **15.3% and 15.5%** relative to `a1126dc` (4.8% and 4.7% relative to
+`a8cc10c`). Their total generation times are 33.3361 s and 33.3690 s; peak device memory remains 6.75 GiB.
+GPU 0 peaked at 51 C / 54 C without reported thermal throttling. The small case still has no measured speedup.
+The final integrated kernel timings are 6.403 / 2.439 / 9.235 / 5.259 ms, with DiT attention 12.129 ms.
+Logs and telemetry are `build-tools/guard-*`; generated reports, latents and images are
+`build-sm70/validation/guard-{apple,city,cup}-opt*`.
+
+Validation passes all 10 SM70/build/conversion tests, both host-reference checks (`all`/`big`), memcheck on
+INT8/attention (zero errors), racecheck on the norm guard and fast/fallback tiles (zero errors/warnings), 517 CPU
+cases with normal fixture skips, the CMP0007 wrapper, and nine default-off backend-probe tests. The complete
+SM70 build also links the shared library and server.
 
 Probe sources and generation/build helpers are retained here. With the configured `build-sm70` directory:
 
