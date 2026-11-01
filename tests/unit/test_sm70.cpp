@@ -53,7 +53,7 @@ class Buffer {
   std::size_t n_;
 };
 
-void check_gemm(int m, int n, int k, bool adversarial, bool bounded = false, bool saturated = false) {
+void check_gemm(int m, int n, int k, bool adversarial, bool bounded = false, bool saturated = false, bool row_bounded = false) {
   const int ldx = k + 16, ldo = n + 8;
   std::vector<std::int8_t> x(static_cast<std::size_t>(m) * ldx, 0), w(static_cast<std::size_t>(n) * k);
   std::uint32_t rng = 42;
@@ -74,6 +74,25 @@ void check_gemm(int m, int n, int k, bool adversarial, bool bounded = false, boo
           (adversarial ? static_cast<std::int8_t>(d == k - 1 ? c - 8 : v) : next());
     }
   }
+  if (row_bounded) {
+    // One large activation row and 128 large weight rows: only their crossing decision tiles need integer folds.
+    // Odd, cancelling products expose an incorrectly selected no-fold tile even when the final result is small.
+    for (int r = 0; r < m; ++r) for (int d = 0; d < k; ++d) {
+      x[std::size_t(r) * ldx + d] = r == 0 ? 127 : x[std::size_t(r) * ldx + d] / 4;
+    }
+    for (int c = 0; c < n; ++c) for (int d = 0; d < k; ++d) {
+      auto& v = w[std::size_t(c) * k + d];
+      v = c < 128 ? (d == k - 1 ? c - 64 : (d < k / 2 ? 127 : -127)) : v / 4;
+    }
+  }
+  const auto norms = [](const auto& v, int rows, int k, int ld) {
+    std::vector<std::uint32_t> out(rows, 0);
+    for (int r = 0; r < rows; ++r) for (int c = 0; c < k; ++c) {
+      const int x = v[std::size_t(r) * ld + c];
+      out[r] += x * x;
+    }
+    return out;
+  };
   std::vector<float> xs(static_cast<std::size_t>(m)), ws(static_cast<std::size_t>(n));
   std::vector<std::uint16_t> bias(static_cast<std::size_t>(n)), gate(static_cast<std::size_t>(n));
   for (int r = 0; r < m; ++r) xs[static_cast<std::size_t>(r)] = 0.001f * static_cast<float>(r % 7 + 1);
@@ -101,6 +120,16 @@ void check_gemm(int m, int n, int k, bool adversarial, bool bounded = false, boo
   Buffer<std::uint32_t> bounds(std::vector<std::uint32_t>(6, 0xdeadbeefu));
   mi::kernels::quant::Int8Operands p{dx.get(), ldx, dxs.get(), dw.get(), dws.get(), m, n, k};
   if (bounded) p.norm_bounds = bounds.get() + 2;
+  Buffer<std::uint32_t> xn(std::vector<std::uint32_t>(m, 0)), wn(std::vector<std::uint32_t>(n, 0));
+#if MOSSINFER_HAVE_SM70
+  if (row_bounded) {
+    mi::kernels::quant::int8_row_norms(dx.get(), m, k, ldx, xn.get(), nullptr);
+    mi::kernels::quant::int8_row_norms(dw.get(), n, k, k, wn.get(), nullptr);
+    ASSERT_EQ(xn.host(), norms(x, m, k, ldx));
+    ASSERT_EQ(wn.host(), norms(w, n, k, k));
+    p.x_norm = xn.get(); p.w_norm = wn.get();
+  }
+#endif
   const auto ptr = [](std::uint16_t* b) { return reinterpret_cast<__nv_bfloat16*>(b); };
   mi::kernels::quant::int8_gemm(p, ptr(db.get()), ptr(out.get()), ldo, nullptr);
   ASSERT_EQ(out.host(), expected);
@@ -150,10 +179,10 @@ void check_gemm(int m, int n, int k, bool adversarial, bool bounded = false, boo
       }
       return maximum;
     };
-    const auto xn = row_max(x, m, ldx, k), wn = row_max(w, n, k, k);
-    EXPECT_EQ(bounds.host(), (std::vector<std::uint32_t>{0xdeadbeefu, 0xdeadbeefu, xn, wn, 0xdeadbeefu, 0xdeadbeefu}));
+    const auto xmax = row_max(x, m, ldx, k), wmax = row_max(w, n, k, k);
+    EXPECT_EQ(bounds.host(), (std::vector<std::uint32_t>{0xdeadbeefu, 0xdeadbeefu, xmax, wmax, 0xdeadbeefu, 0xdeadbeefu}));
     if (saturated) {
-      EXPECT_EQ(std::uint64_t(xn) * wn <= (std::uint64_t{1} << 48), k <= 1024);
+      EXPECT_EQ(std::uint64_t(xmax) * wmax <= (std::uint64_t{1} << 48), k <= 1024);
     }
     p.norm_bounds = bounds.get() + 1;
     EXPECT_THROW(mi::kernels::quant::int8_gemm(p, ptr(db.get()), ptr(out.get()), ldo, nullptr), std::invalid_argument);
@@ -209,6 +238,54 @@ TEST(GpuSm70, Int8NormGuardAndFallback) {
   check_gemm(1025, 16, 4096, true, true);  // odd products lose fp32 integer units without the fallback
 }
 
+TEST(GpuSm70, Int8TileNormsMixedFallback) {
+  if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs Volta";
+  check_gemm(1025, 264, 4096, false, false, false, true);
+  check_gemm(3, 136, 1040, false, false, false, true);  // short shapes keep the folded path
+}
+
+TEST(GpuSm70, QuantizedRowNormsAndGraph) {
+  if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs Volta";
+  namespace q = mi::kernels::quant;
+  constexpr int m = 17;
+  for (int k : {256, 768, 3072, 8192, 32768}) {
+    std::vector<std::uint16_t> values(std::size_t(m) * k);
+    for (std::size_t i = 0; i < values.size(); ++i) values[i] = bf16(float(int(i * 13 % 113) - 56) / 17.f);
+    values[0] = 0x7fc0; values[k] = 0x7f80; values[2 * k] = 0xff80;
+    Buffer<std::uint16_t> x(values), weight(std::vector<std::uint16_t>(k, bf16(1.f))), zero(std::vector<std::uint16_t>(k, 0));
+    Buffer<std::int8_t> plain(std::vector<std::int8_t>(values.size(), 0)), bounded(std::vector<std::int8_t>(values.size(), 0));
+    Buffer<float> ps(std::vector<float>(m, 0)), bs(std::vector<float>(m, 0));
+    Buffer<std::uint32_t> norms(std::vector<std::uint32_t>(m + 2, 0xdeadbeefu));
+    const auto bf = [](const Buffer<std::uint16_t>& b) { return reinterpret_cast<const __nv_bfloat16*>(b.get()); };
+    for (bool fused : {false, true}) {
+      if (fused && k > 7680) continue;
+      const auto run = [&](bool with_norms, cudaStream_t stream) {
+        auto* out = with_norms ? bounded.get() : plain.get();
+        auto* scale = with_norms ? bs.get() : ps.get();
+        auto* sums = with_norms ? norms.get() + 1 : nullptr;
+        if (fused) q::rms_norm_modulate_rotate_quantize(bf(x), k, bf(weight), bf(zero), bf(zero), out, k,
+                                                       scale, m, k, stream, nullptr, 0, sums);
+        else q::rotate_quantize(bf(x), k, out, k, scale, m, k, stream, sums);
+      };
+      run(false, nullptr);
+      cudaStream_t stream; MI_CUDA_CHECK(cudaStreamCreate(&stream));
+      MI_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      run(true, stream);
+      cudaGraph_t graph; MI_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+      cudaGraphExec_t exec; MI_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+      MI_CUDA_CHECK(cudaGraphLaunch(exec, stream));
+      MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+      cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+      const auto data = bounded.host();
+      EXPECT_EQ(data, plain.host()); EXPECT_EQ(bs.host(), ps.host());
+      std::vector<std::uint32_t> expected(m + 2, 0);
+      expected.front() = expected.back() = 0xdeadbeefu;
+      for (int r = 0; r < m; ++r) for (int c = 0; c < k; ++c) { const int v = data[std::size_t(r) * k + c]; expected[r + 1] += v * v; }
+      EXPECT_EQ(norms.host(), expected) << "k=" << k << " fused=" << fused;
+    }
+  }
+}
+
 TEST(GpuSm70, AttentionStridesVarlenAndGraph) {
   if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
   constexpr int heads = 4, kv_heads = 2, dim = 128, head_stride = dim + 8;
@@ -232,7 +309,8 @@ TEST(GpuSm70, AttentionStridesVarlenAndGraph) {
   Buffer<std::uint16_t> dq(hq), dk(hk), dv(hv);
   Buffer<std::uint16_t> dout(std::vector<std::uint16_t>(hq.size(), sentinel));
   Buffer<int> dcq(cq), dck(ck);
-  Buffer<float> lse(std::vector<float>(static_cast<std::size_t>(total_q) * heads));
+  const auto prepared_bytes = mi::kernels::sm70::flash_fwd_preconvert_bytes(total_q, ck.back(), heads, kv_heads);
+  Buffer<float> lse(std::vector<float>(prepared_bytes / sizeof(float)));
   const auto view = [&](std::uint16_t* ptr, int tokens, int nh, int stride) {
     Tensor t = Tensor::view(ptr, DType::kBF16, Device::kCUDA, {tokens, nh, dim});
     t.stride[0] = stride;
@@ -244,12 +322,14 @@ TEST(GpuSm70, AttentionStridesVarlenAndGraph) {
   const auto cuq = Tensor::view(dcq.get(), DType::kI32, Device::kCUDA, {4});
   const auto cuk = Tensor::view(dck.get(), DType::kI32, Device::kCUDA, {4});
   const float scale = 1.f / std::sqrt(static_cast<float>(dim));
+  bool prepared = false;
   const auto run = [&](cudaStream_t stream) {
     mi::attention::flash_fwd(q, k, v, o, cuq, cuk, 1105, false, scale, lse.get(),
-                              mi::attention::flash_fwd_workspace_bytes(total_q, heads), stream);
+                              prepared ? prepared_bytes : mi::attention::flash_fwd_workspace_bytes(total_q, heads), stream);
   };
   run(nullptr);
   const auto first = dout.host();
+  prepared = true;  // Graph replay must exactly match the original tile-conversion path.
   cudaStream_t stream = nullptr;
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t exec = nullptr;

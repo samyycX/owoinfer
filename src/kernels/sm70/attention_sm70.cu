@@ -1,5 +1,5 @@
 // Exact varlen/GQA attention on Volta: fp16 WMMA with fp32 scores, online softmax and accumulation. Q/K/V stay
-// bf16 in global memory; only shared-memory tiles are converted. No quadratic score buffer or hidden allocation.
+// bf16 in global memory; optional caller scratch converts long D=128 K/V once. No quadratic score buffer or hidden allocation.
 // A warp owns 16 query rows. The sm_70 accumulator row groups use lane XOR 2/8 (unlike Turing's XOR 1/2);
 // coordinates are loaded through WMMA itself, so output stores follow its fragment layout. D=128 keeps the
 // softmax tile in registers and shuffles it into the next MMA input; D=256 retains its shared-memory path.
@@ -25,6 +25,9 @@ struct Params {
   const __nv_bfloat16* v = nullptr;
   __nv_bfloat16* o = nullptr;
   float* lse = nullptr;
+  const __half* kh = nullptr;
+  const __half* vh = nullptr;
+  int total_k = 0;
   std::int64_t q_row = 0, q_head = 0;
   std::int64_t k_row = 0, k_head = 0;
   std::int64_t v_row = 0, v_head = 0;
@@ -35,6 +38,22 @@ struct Params {
   float scale = 1.f;
   bool causal = false;
 };
+
+__global__ void preconvert(Params p, __half* kh, __half* vh) {
+  const std::int64_t i = (std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+  const int d = i % 128, row = i / 128 / p.kv_heads, head = i / 128 % p.kv_heads;
+  if (row >= p.total_k) return;
+  const uint4 kr = *reinterpret_cast<const uint4*>(p.k + row * p.k_row + head * p.k_head + d);
+  const uint4 vr = *reinterpret_cast<const uint4*>(p.v + row * p.v_row + head * p.v_head + d);
+  uint4 ko, vo;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    reinterpret_cast<__half*>(&ko)[e] = __float2half_rn(__bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&kr)[e]));
+    reinterpret_cast<__half*>(&vo)[e] = __float2half_rn(__bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&vr)[e]));
+  }
+  *reinterpret_cast<uint4*>(kh + (std::int64_t(head) * p.total_k + row) * 128 + d) = ko;
+  *reinterpret_cast<uint4*>(vh + (std::int64_t(head) * p.total_k + row) * 128 + d) = vo;
+}
 
 // SparkAttention's warp layout transform, adapted to Volta's 16x16 WMMA fragments (FP32 accumulators).
 // C gives a lane two rows and four columns; A needs one complete row, duplicated across lane bit 3.
@@ -70,7 +89,7 @@ __device__ __forceinline__ A probability_fragment(const Acc& s, int lane) {
   return a;
 }
 
-template <int D, int BN, int kBM>
+template <int D, int BN, int kBM, bool Prepared = false>
 __global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
   constexpr int kThreads = kBM * 2;
   constexpr int kQStride = D + 8, kVStride = BN + 8;
@@ -118,8 +137,10 @@ __global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
     for (int i = tid; i < BN * D; i += kThreads) {
       const int j = i / D, d = i % D, token = k_start + j0 + j;
       const bool valid = j0 + j < len_k;
-      ks[j * kQStride + d] = __float2half_rn(valid ? __bfloat162float(p.k[token * p.k_row + kv_head * p.k_head + d]) : 0.f);
-      vt[d * kVStride + j] = __float2half_rn(valid ? __bfloat162float(p.v[token * p.v_row + kv_head * p.v_head + d]) : 0.f);
+      if constexpr (D == 128 && Prepared) ks[j * kQStride + d] = valid ? p.kh[(std::int64_t(kv_head) * p.total_k + token) * D + d] : __float2half_rn(0.f);
+      else ks[j * kQStride + d] = __float2half_rn(valid ? __bfloat162float(p.k[token * p.k_row + kv_head * p.k_head + d]) : 0.f);
+      if constexpr (D == 128 && Prepared) vt[d * kVStride + j] = valid ? p.vh[(std::int64_t(kv_head) * p.total_k + token) * D + d] : __float2half_rn(0.f);
+      else vt[d * kVStride + j] = __float2half_rn(valid ? __bfloat162float(p.v[token * p.v_row + kv_head * p.v_head + d]) : 0.f);
     }
     __syncthreads();
     Acc s[BN / 16];
@@ -214,12 +235,12 @@ __global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
   }
 }
 
-template <int D, int BN, int kBM>
+template <int D, int BN, int kBM, bool Prepared = false>
 void launch(const Params& p, int max_seqlen, int batch, cudaStream_t stream) {
   constexpr int kThreads = kBM * 2;
   constexpr int bytes = ((kBM + BN) * (D + 8) + (D + (D == 128 ? 0 : kBM)) * (BN + 8)) * sizeof(__half);
   static_assert(bytes <= 96 * 1024);
-  auto kernel = &attention_kernel<D, BN, kBM>;
+  auto kernel = &attention_kernel<D, BN, kBM, Prepared>;
   if constexpr (bytes > 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
   const dim3 grid(static_cast<unsigned>((max_seqlen + kBM - 1) / kBM), static_cast<unsigned>(batch),
                   static_cast<unsigned>(p.heads));
@@ -273,6 +294,23 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   const int batch = static_cast<int>(cu_seqlens_q.dim(0) - 1);
 
   if (head_dim == 128) {
+    const std::size_t need = flash_fwd_preconvert_bytes(total_q, k.dim(0), heads, kv_heads);
+    const bool aligned = reinterpret_cast<std::uintptr_t>(k.data) % 16 == 0 &&
+                         reinterpret_cast<std::uintptr_t>(v.data) % 16 == 0 &&
+                         k.stride[0] % 8 == 0 && k.stride[1] % 8 == 0 &&
+                         v.stride[0] % 8 == 0 && v.stride[1] % 8 == 0;
+    if (max_seqlen >= 1024 && k.dim(0) > 0 && workspace_bytes >= need &&
+        reinterpret_cast<std::uintptr_t>(workspace) % 16 == 0 && aligned) {
+      const std::size_t elements = std::size_t(k.dim(0)) * kv_heads * 128;
+      const std::size_t lse_bytes = (std::size_t(total_q) * heads * sizeof(float) + 15) / 16 * 16;
+      auto* kh = reinterpret_cast<__half*>(static_cast<char*>(workspace) + lse_bytes);
+      auto* vh = kh + elements;
+      p.total_k = k.dim(0); p.kh = kh; p.vh = vh;
+      preconvert<<<(elements / 8 + 255) / 256, 256, 0, stream>>>(p, kh, vh);
+      MI_CUDA_CHECK_LAUNCH();
+      launch<128, 64, 192, true>(p, max_seqlen, batch, stream);
+      return;
+    }
     if (max_seqlen >= 1024) launch<128, 64, 192>(p, max_seqlen, batch, stream);
     else launch<128, 32, 128>(p, max_seqlen, batch, stream);
   } else {

@@ -58,6 +58,8 @@ void gemm(int m, int n, int k, int epilogue) {
   mi::kernels::quant::Int8Operands p{x.get<std::int8_t>(), k, xs.get<float>(), w.get<std::int8_t>(), ws.get<float>(), m, n, k};
   Buffer bounds(2 * sizeof(std::uint32_t));
   p.norm_bounds = bounds.get<std::uint32_t>();  // match the DiT caller; norm checks and the fallback launch are timed
+  Buffer xn(static_cast<std::size_t>(m) * sizeof(std::uint32_t)), wn(static_cast<std::size_t>(n) * sizeof(std::uint32_t));
+  p.x_norm = xn.get<std::uint32_t>(); p.w_norm = wn.get<std::uint32_t>();  // exact for the zero-filled operands
   const float ms = time_ms([&] {
     if (epilogue == 2) mi::kernels::quant::int8_gemm_situ_glu(p, out.get<__nv_bfloat16>(), n / 2, nullptr);
     else if (epilogue == 1) mi::kernels::quant::int8_gemm_gated_residual(p, bias.get<__nv_bfloat16>(), gate.get<__nv_bfloat16>(),
@@ -73,7 +75,9 @@ void attention(int length, int heads, int kv_heads, int dim, bool causal) {
   const int tokens = batch * length;
   Buffer q(static_cast<std::size_t>(tokens) * heads * dim * 2), out(static_cast<std::size_t>(tokens) * heads * dim * 2);
   Buffer k(static_cast<std::size_t>(tokens) * kv_heads * dim * 2), v(static_cast<std::size_t>(tokens) * kv_heads * dim * 2);
-  Buffer cu((batch + 1) * sizeof(int)), lse(static_cast<std::size_t>(tokens) * heads * sizeof(float));
+  const auto workspace_bytes = dim == 128 ? mi::kernels::sm70::flash_fwd_preconvert_bytes(tokens, tokens, heads, kv_heads)
+                                         : static_cast<std::size_t>(tokens) * heads * sizeof(float);
+  Buffer cu((batch + 1) * sizeof(int)), lse(workspace_bytes);
   const int bounds[] = {0, length, tokens};
   MI_CUDA_CHECK(cudaMemcpy(cu.get<int>(), bounds, sizeof(bounds), cudaMemcpyHostToDevice));
   const auto tensor = [](const Buffer& b, int t, int h, int d) {
@@ -84,7 +88,7 @@ void attention(int length, int heads, int kv_heads, int dim, bool causal) {
   const auto tc = mi::Tensor::view(cu.get<int>(), mi::DType::kI32, mi::Device::kCUDA, {batch + 1});
   const float ms = time_ms([&] {
     mi::attention::flash_fwd(tq, tk, tv, to, tc, tc, length, causal, 1.f / std::sqrt(static_cast<float>(dim)),
-                              lse.get<void>(), static_cast<std::size_t>(tokens) * heads * sizeof(float), nullptr);
+                              lse.get<void>(), workspace_bytes, nullptr);
   });
   std::printf("attention L=%d H=%d KV=%d D=%d causal=%d: %.3f ms\n", length, heads, kv_heads, dim, causal, ms);
 }

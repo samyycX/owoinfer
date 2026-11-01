@@ -11,6 +11,8 @@ bool available();
 // Cached per device; true only on compute capability 7.0/7.2 in a build carrying the Volta kernel family.
 bool volta();
 
+// Optional D=128 scratch: LSE followed by head-major fp16 K/V. Smaller workspaces keep tile-local conversion.
+std::size_t flash_fwd_preconvert_bytes(std::int64_t total_q, std::int64_t total_k, int heads, int kv_heads);
 void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& cu_seqlens_q,
                const Tensor& cu_seqlens_k, int max_seqlen, bool causal, float scale, void* workspace,
                std::size_t workspace_bytes, cudaStream_t stream);

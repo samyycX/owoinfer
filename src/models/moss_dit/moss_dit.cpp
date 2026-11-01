@@ -17,6 +17,7 @@
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/norm.h"
 #include "kernels/basic/rope.h"
+#include "kernels/sm70/sm70.h"
 #include "kernels/sm75/sm75.h"
 #include "models/lora/lora_merge_device.h"
 #include "models/moss_dit/dit_kernels.h"
@@ -153,6 +154,9 @@ struct MossDit::Activations {
     cu_seqlens = p.tensor(DType::kI32, {cu_pool_ints(rows)});
     if (slots > 0) cu_seqlens_k = p.tensor(DType::kI32, {cu_pool_ints(rows)});
     lse_bytes = attention::flash_fwd_workspace_bytes(tokens, kHeads);
+    if (tokens >= 1024 && kernels::sm70::volta()) {
+      lse_bytes = std::max(lse_bytes, kernels::sm70::flash_fwd_preconvert_bytes(tokens, tokens + 2 * slots, kHeads, kHeads));
+    }
     lse = p.bytes(lse_bytes);
     if (step) {
       mod = p.tensor(DType::kBF16, {6 * kDim});
@@ -550,6 +554,10 @@ bool MossDit::rebase_merges(const lora::LoraStack* stack, const std::string& mem
     throw;
   }
   for (const MergeStaging& st : staged) st.store();
+  if (kernels::sm70::volta() && blocks_) {
+    blocks_->refresh_int8_norms(nullptr);
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+  }
   if (!memo_key.empty() && !memo_hit) {
     // The new stack's merged bits, when they and their pristine copies fit the cap (a stack merging more is merged again
     // when it comes back).
@@ -621,6 +629,10 @@ void MossDit::remerge_lora(const lora::LoraStack& stack) {
     }
     remerge_into(*pristine_, stack, module, t, staging);
     staging.store();
+  }
+  if (kernels::sm70::volta() && blocks_) {
+    blocks_->refresh_int8_norms(nullptr);
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
   }
 }
 
@@ -825,6 +837,10 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
       for (Linear* l : {&b.qkv, &b.proj, &b.up_gate, &b.down}) kernels::sm75::convert_weight_inplace(l->w, nullptr);
     }
     blocks_->convert_weights_to_f16(nullptr);
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+  }
+  if (kernels::sm70::volta()) {
+    blocks_->refresh_int8_norms(nullptr);  // after upload completion and all load-time merges
     MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
   }
   load_stats_.direct = readers.all_direct();

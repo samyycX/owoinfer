@@ -247,7 +247,28 @@ __global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E, Tile, Fast
   const auto tile = qd::Swizzle::get_tile_offset(log_tile);
   const int m0 = tile.m() * BM, n0 = tile.n() * BN;
   if (m0 >= p.m || n0 >= p.n) return;
-  if (bounds) {
+  if (p.x_norm && p.w_norm) {
+    __shared__ bool safe_tile;
+    if (warp == 0) {
+      // Fast and folded SiTU tiles have different widths. Both use the same canonical 128x256 decision tile,
+      // so a rejected fast tile is covered by exactly two folded 128x128 tiles, without double writes or holes.
+      constexpr int GN = E == Epilogue::kSitu ? 256 : 128;
+      const int nbase = (n0 / GN) * GN;
+      unsigned xn = 0, wn = 0;
+      for (int r = lane; r < 128; r += 32) if (m0 + r < p.m) xn = max(xn, p.x_norm[m0 + r]);
+      for (int c = lane; c < GN; c += 32) {
+        const int col = nbase + c;
+        if (col < p.n) wn = max(wn, p.w_norm[E == Epilogue::kSitu ? qd::up_gate_row(col, p.n / 2) : col]);
+      }
+      for (int d = 16; d > 0; d /= 2) {
+        xn = max(xn, __shfl_down_sync(0xffffffffu, xn, d));
+        wn = max(wn, __shfl_down_sync(0xffffffffu, wn, d));
+      }
+      if (lane == 0) safe_tile = std::uint64_t(xn) * wn <= (std::uint64_t{1} << 48);
+    }
+    __syncthreads();
+    if (safe_tile != Fast) return;
+  } else if (bounds) {
     const bool safe = std::uint64_t(bounds[0]) * bounds[1] <= (std::uint64_t{1} << 48);
     if (safe != Fast) return;
   }
@@ -306,7 +327,8 @@ void launch_tile(const quant::Int8Operands& p, const __nv_bfloat16* bias, const 
   if constexpr (E == Epilogue::kSitu) tables = situ_tables(stream);
   constexpr int bytes = sizeof(typename Kernel<E, Tile, Fast>::SharedStorage);
   auto kernel = &int8_kernel<E, Tile, Fast>;
-  if constexpr (bytes > 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+  // The per-tile guard also uses static shared memory, so a 48 KiB dynamic tile needs opt-in.
+  if constexpr (bytes >= 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
   kernel<<<grid, kThreads, bytes, stream>>>(p, pa, pb, bias, gate, out, ldo, tables, log_tile, bounds);
   MI_CUDA_CHECK_LAUNCH();
 }
@@ -314,26 +336,31 @@ void launch_tile(const quant::Int8Operands& p, const __nv_bfloat16* bias, const 
 template <Epilogue E>
 void launch(const quant::Int8Operands& p, const __nv_bfloat16* bias, const __nv_bfloat16* gate,
              __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
-  // More rows reuse each weight tile during DiT prefill; short text/boundary shapes retain the smaller tile.
-  if (p.m >= 1024) {
-    if constexpr (E == Epilogue::kPlain || E == Epilogue::kSitu) {
-      using FastTile = std::conditional_t<E == Epilogue::kSitu, qd::TileCfg<128, 256, 32, 64, 64, 2>,
-                                                                  qd::TileCfg<128, 128, 32, 64, 64, 2>>;
-      if (p.norm_bounds != nullptr) {
-        MI_CUDA_CHECK(cudaMemsetAsync(p.norm_bounds, 0, 2 * sizeof(std::uint32_t), stream));
-        norm_bounds_kernel<<<(p.m + p.n + 7) / 8, 256, 0, stream>>>(p, p.norm_bounds);
-        MI_CUDA_CHECK_LAUNCH();
-        // Exactly one kernel writes each output. The other exits before touching the residual/SiTU output.
-        launch_tile<E, FastTile, true>(p, bias, gate, out, ldo, stream, p.norm_bounds);
-        launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream, p.norm_bounds);
-      } else {
-        launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream);
-      }
-    } else {
-      launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream);
+  if (p.m >= 1024 && (p.norm_bounds || (p.x_norm && p.w_norm))) {
+    using FastTile = std::conditional_t<E == Epilogue::kSitu, qd::TileCfg<128, 256, 32, 64, 64, 2>,
+                                                               qd::TileCfg<128, 128, 32, 64, 64, 2>>;
+    const unsigned* bounds = nullptr;
+    if (!p.x_norm) {
+      MI_CUDA_CHECK(cudaMemsetAsync(p.norm_bounds, 0, 2 * sizeof(std::uint32_t), stream));
+      norm_bounds_kernel<<<(p.m + p.n + 7) / 8, 256, 0, stream>>>(p, p.norm_bounds);
+      MI_CUDA_CHECK_LAUNCH();
+      bounds = p.norm_bounds;
     }
+    if constexpr (E == Epilogue::kResidual) {
+      if (p.k <= 3072) launch_tile<E, Sm70LargeTile, true>(p, bias, gate, out, ldo, stream, bounds);
+      else launch_tile<E, FastTile, true>(p, bias, gate, out, ldo, stream, bounds);
+    } else {
+      launch_tile<E, FastTile, true>(p, bias, gate, out, ldo, stream, bounds);
+    }
+    launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream, bounds);
+  } else if (p.m >= 1024) {
+    launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream);
+  } else {
+    // Row-norm callers can also reach short shapes. These retain the folded kernel without conditional dispatch.
+    auto small = p;
+    small.x_norm = small.w_norm = nullptr;
+    launch_tile<E, Sm70SmallTile>(small, bias, gate, out, ldo, stream);
   }
-  else launch_tile<E, Sm70SmallTile>(p, bias, gate, out, ldo, stream);
 }
 
 }  // namespace

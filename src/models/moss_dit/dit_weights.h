@@ -75,6 +75,7 @@ std::bitset<kNumBlocks> resident_mask(int resident_blocks);
 struct Int8Linear {
   Tensor w;
   Tensor scale;
+  Tensor squared_norm{};  // optional model-owned uint32 [N] (kI32 storage), refreshed after weight changes
   bool empty() const { return w.data == nullptr; }
 };
 
@@ -214,6 +215,8 @@ class BlockWeights {
   // fp16 GEMM path can consume them (the views are marked kF16). Streamed blocks are converted by Pass::acquire(),
   // after each block's copy. No-op on sm_80+ devices and when the build has no sm_75 kernels.
   void convert_weights_to_f16(cudaStream_t stream);
+  // Volta resident INT8 metadata. Streamed blocks retain the scan-based bound; never cache a recycled buffer address.
+  void refresh_int8_norms(cudaStream_t stream);
   void set_copy_hook(CopyHook hook) { hook_ = std::move(hook); }
 
   // Stats of the last finished forward() (synchronizes on its events the first time it is read) and the sum over

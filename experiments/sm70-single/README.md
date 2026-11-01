@@ -147,3 +147,97 @@ python3 experiments/sm70-single/build_probe.py experiments/sm70-single/cublas_ce
 Generators intentionally read the first-stage source from `a8cc10c`. Generated sources and executables live in
 ignored `build-tools/`. `norm_probe.cuh` synchronizes and logs for measurement; `norm_guard_probe.cuh` has a
 single-device scratch allocation for prototyping. Neither is included by the production implementation.
+
+## Third stage: cached row norms and prepared K/V
+
+Resident INT8 weights now own exact uint32 squared row norms in the model arena. Loading and both LoRA merge
+paths refresh that metadata after weight changes. Streamed/recycled buffers retain per-call scanning. The
+quantizers optionally emit activation norms from their packed INT8 registers, without rereading the input.
+Volta GEMMs bound each 128x128 tile independently; SiTU uses a canonical 128x256 decision region shared by its
+fast CTA and its two folded fallback CTAs. Exactly one path writes every result, including gated residuals.
+O uses the existing 32x64 warp without folds when safe; down uses a 64x64 warp. Short shapes retain integer folds.
+Other architectures ignore the optional metadata, and quantizers without a norm output retain their old variant.
+
+Long D=128 attention optionally converts K/V once into head-major FP16 buffers. The caller reserves this space
+in its activation plan; the compatibility kernel never allocates or synchronizes. Minimum-workspace callers,
+unaligned layouts, short sequences and D=256 retain tile-local conversion. The conversion, FP32 accumulation,
+32-key softmax updates and output rounding are unchanged. On the 8222-token DiT shape the two buffers use about
+96.35 MiB, in addition to LSE; resident weight norms use about 5.1 MiB across 42 blocks.
+
+The baseline Nsight Systems trace measured the old norm scan at **6.984 ms/step**, rather than the suggested
+15–30 ms estimate. Fused norm/modulate/quantize, QK norm/RoPE, down-input quantization and O-input quantization
+accounted for approximately 37.640, 25.868, 18.750 and 6.689 ms/step respectively. These are traced measurements;
+use uninstrumented runs for end-to-end comparisons. Hardware counters remain unavailable under the existing
+Nsight Compute permissions.
+
+The initial integration measured 31.5596 s/20 steps with cached norms and residual fast paths (1.5780 s/step),
+then **30.9699 s/20 steps with prepared K/V (1.5485 s/step)**. Both final FP32 latents matched the original baseline
+byte-for-byte. This is a modest measured gain over 1.60 s/step; the suggested 1.30–1.35 s/step was not achieved.
+
+### Final selected build
+
+| Prompt / seed / mode | Size / steps | Denoise | Mean step | Total generation |
+|---|---|---:|---:|---:|
+| Apple / 42 / `max_speed` | 1024² / 20 | 31.0510 s | 1.5526 s | 32.6042 s |
+| Coastal city / 7 / `max_speed` | 1024² / 20 | 31.2554 s | 1.5628 s | 33.1865 s |
+| Green cup / 123 / `min_memory` | 256² / 3 | 1.1369 s | 0.3790 s | 2.4649 s |
+
+All three final FP32 latents are byte-identical to `a1126dc`; all decoded RGB pixels match exactly. Large-case
+denoise reductions are 17.8% / 17.7% versus that baseline and 3.0% / 2.7% versus `efa8971`. The small streamed
+case has no measured benefit. Reported peak device memory remains 6.75 GiB for the large cases: the additional
+K/V storage fits below another phase's allocation peak. GPU 0 peaked at 51 C / 55 C without thermal slowdown.
+
+Final kernel timings are 6.506 / 2.424 / 9.063 / 4.937 ms (QKV / O / up / down), DiT attention 11.508 ms and text
+attention 0.267 ms. GEMM timing includes the tile guard and inactive fallback launch, but not the preceding
+quantizer's fused norm calculation or the one-time weight norm scan. Attention timing includes K/V preconversion.
+
+Raw reports, FP32 latents and PNGs are `build-sm70/validation/phase3-selected-{apple,city,cup}-opt*`; telemetry
+and validation logs are `build-tools/phase3-selected-*`. `build-tools/validate-phase3-selected.py` reproduces
+these three cases against the locally saved baseline artifacts. Earlier probe artifacts use the `phase3-` prefix.
+
+### Other candidates measured and excluded
+
+| Probe | Result / decision |
+|---|---|
+| Same CUTLASS loop, FP16 inputs | 64x64 warp: 6.164 / 2.503 / 9.511 / 4.634 ms for QKV / O / up / down. Removing INT8 conversion does not close the cuBLAS gap. |
+| Complete cuBLAS pipeline, vectorized conversion and epilogue | QKV/O microbench: 5.937 / 2.039 ms, including conversion and FP32 intermediate. A caller-workspace integration preserved latent/PNG bits, but did not give a stable whole-image gain. |
+| Paired native / cuBLAS / cuBLAS / native | 31.3109 / 31.4121 / 31.5073 / 31.5699 s for 20 apple steps; means 1.5720 vs 1.5730 s/step. Both used the same extracted tile-guard helper for this comparison. Removed the cuBLAS production path and its extra scratch/API. |
+| Shared BF16 staging plus coalesced stores | 6.207 / 2.614 / 9.132 / 5.033 ms; mixed results, no general improvement. |
+| QKV + Q/K norm/RoPE fusion | Zero differing BF16 elements, but 6.512 ms versus 6.210 ms separately. |
+| Prepared K/V, transposed vs row-major shared V | 11.507 vs 12.503 ms. Retain the existing transposed V layout. |
+| Register prefetch, 128/192 queries and 32/64 keys | 15.466–33.625 ms versus about 12.13 ms without it; high register pressure/spills. |
+
+The cuBLAS A/B telemetry peaked at 53–57 C and 1470–1515 MHz in the native runs, with no reported thermal
+slowdown. Software power-cap events occurred in both variants. No clocks, power limits or driver permissions
+were changed. Microbenchmark improvements alone were insufficient to justify the more complex dispatch.
+
+### Reproducing the probes
+
+Run from the repository root, with the SM70 build configured. These are separate experimental executables;
+none of their headers are included by production code. FP16 diagnostics use zero-filled integer-valued inputs;
+prototype cuBLAS vector stores target the aligned DiT benchmark shapes, not the generic kernel contract.
+Some prototypes intentionally own single-device scratch to isolate an idea and are unsuitable for integration.
+
+```sh
+python3 experiments/sm70-single/make_fp16_diagnostic.py
+python3 experiments/sm70-single/build_probe.py --cutlass build-tools/gemm-fp16-w64.cu
+python3 experiments/sm70-single/make_cublas_pipeline.py
+python3 experiments/sm70-single/make_cublas_vector_probe.py
+python3 experiments/sm70-single/build_gemm_probe.py gemm-cublas-vector
+python3 experiments/sm70-single/make_preconvert_attention.py
+python3 experiments/sm70-single/make_prefetch_attention.py
+python3 experiments/sm70-single/make_coalesced_gemm.py
+python3 experiments/sm70-single/make_qkv_norm_probe.py
+python3 experiments/sm70-single/build_probe.py --cutlass build-tools/gemm-qkv-norm.cu
+```
+
+Use `build_attention_probe.py NAME` for generated attention kernels and `build_gemm_probe.py NAME` for GEMM
+replacement kernels; the QKV-fusion source has its own main and uses `build_probe.py --cutlass`. The FP16/cuBLAS probes read `8c21627`, and attention probes read `efa8971`, keeping their starting point
+fixed. Coalesced-store and QKV-fusion probes read the current selected native GEMM. Generated CUDA sources,
+executables, resource reports and raw timings stay in ignored `build-tools/`.
+
+Final validation: all 12 SM70/build/conversion tests, `sm70_check all` and `big`, memcheck on all INT8 tests,
+fused quantized norms and attention (zero errors), and racecheck on mixed safe/fallback tiles, fused norms and
+prepared attention (zero errors/warnings). The complete SM70 build links the shared library, server and CLI;
+517 selected CPU cases pass with normal missing-fixture skips, as does the CMP0007 verdict wrapper. The
+SM70-disabled build passes all nine backend-probe tests. Hardware validation is limited to V100.

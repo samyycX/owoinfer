@@ -44,9 +44,10 @@ inline constexpr int kMaxRotateK = 32768;
 
 // Standalone rotate + per-token quantize, for the o-proj input (attention output) and the ffn_down input (SiTU-GLU
 // output). x: bf16 [m, k] with row stride ldx; q: int8 [m, k] with row stride ldq; scale: f32 [m].
+// Optional squared_norm: uint32 [m], disjoint caller output, receives the exact sum of squared quantized bytes.
 // Needs k % 256 == 0, k <= kMaxRotateK, 16-byte aligned x and q with ldx % 8 == 0, ldq % 16 == 0.
 void rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, std::int8_t* q, std::int64_t ldq, float* scale,
-                     std::int64_t m, int k, cudaStream_t stream);
+                     std::int64_t m, int k, cudaStream_t stream, std::uint32_t* squared_norm = nullptr);
 
 // The MOSS pre-attention / pre-FFN input of the qkv and ffn_up_gate GEMMs, fused: the bf16 tensor
 // kernels::rms_norm_modulate_moss(x, norm_weight, mod_scale, mod_shift) would produce for these m rows, then
@@ -62,7 +63,11 @@ void rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, std::int8_t* q, s
 void rms_norm_modulate_rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, const __nv_bfloat16* norm_weight,
                                        const __nv_bfloat16* mod_scale, const __nv_bfloat16* mod_shift, std::int8_t* q,
                                        std::int64_t ldq, float* scale, std::int64_t m, int k, cudaStream_t stream,
-                                       __nv_bfloat16* y = nullptr, std::int64_t ldy = 0);
+                                       __nv_bfloat16* y = nullptr, std::int64_t ldy = 0, std::uint32_t* squared_norm = nullptr);
+
+// Exact per-row squared norms for model-owned weight metadata, refreshed whenever those bytes change.
+void int8_row_norms(const std::int8_t* x, std::int64_t rows, std::int64_t k, std::int64_t ld,
+                    std::uint32_t* out, cudaStream_t stream);
 
 // Largest K the INT8 GEMMs take: the int32 accumulator cannot overflow (see above).
 inline constexpr std::int64_t kMaxInt8GemmK = 131071;
@@ -89,6 +94,10 @@ struct Int8Operands {
   // stream until the GEMM finishes. Volta uses exact squared-norm bounds to select an exact fp32 fast path;
   // nullptr retains integer folds. Other architectures ignore it. Contents are unspecified after the call.
   std::uint32_t* norm_bounds = nullptr;
+  // Optional exact squared row norms, uint32 [m] / [n]. Both must be supplied together and describe the current
+  // operands. Volta uses them for per-tile bounds instead of scanning inputs. Other architectures ignore them.
+  const std::uint32_t* x_norm = nullptr;
+  const std::uint32_t* w_norm = nullptr;
 };
 
 // out[m, n] = bf16((acc * x_scale[r]) * w_scale[c] + bias[c]), bias: bf16 [n] or nullptr. out: bf16, row stride ldo,

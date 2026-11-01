@@ -97,6 +97,7 @@ struct RotateArgs {
   std::int8_t* q;
   std::int64_t ldq;
   float* scale;
+  std::uint32_t* squared_norm = nullptr;
   int k;
   // rms_norm_modulate_rotate_quantize only
   const __nv_bfloat16* weight;
@@ -122,11 +123,12 @@ __device__ __forceinline__ void store16(__nv_bfloat16* p, const float (&v)[16]) 
 // kVT == 0: standalone rotate_quantize. kVT > 0: the MOSS RMSNorm + modulate prologue first (torch reduce with
 // 32 * kVT threads per row); with kStoreY its bf16 output also goes to a.y (a separate instantiation, so the kernels
 // without it compile as before).
-template <int kPairsPerWarp, int kVT, bool kStoreY>
+template <int kPairsPerWarp, int kVT, bool kStoreY, bool kNorm>
 __global__ void rotate_quantize_kernel(RotateArgs a) {
   extern __shared__ float tiles[];  // warps x 2 x kHalfFloats (sized at launch: occupancy)
   __shared__ float warp_max[kMaxWarps];
   __shared__ float inv_rms;
+  __shared__ unsigned warp_norm[kNorm ? kMaxWarps : 1];
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   const int warps = static_cast<int>(blockDim.x) >> 5;
@@ -194,6 +196,7 @@ __global__ void rotate_quantize_kernel(RotateArgs a) {
   if (threadIdx.x == 0) a.scale[row] = s;
   const float s_bf = rbf(s);  // x / scale runs on bf16 tensors
   std::int8_t* qr = a.q + row * a.ldq;
+  int squared = 0;
 #pragma unroll
   for (int i = 0; i < kPairsPerWarp; ++i) {
     if (2 * (warp + i * warps) >= groups) continue;  // warp-uniform, as above
@@ -210,8 +213,37 @@ __global__ void rotate_quantize_kernel(RotateArgs a) {
 #pragma unroll
     for (int j = 0; j < 16; ++j) bytes[j] = static_cast<std::int8_t>(tile[h * kStride + j]);
     __syncwarp();  // the tile is reused by the next pair
-    if (group_of(i) < groups) *reinterpret_cast<uint4*>(qr + group_of(i) * kConvRotGroup + 16 * h) = packed;
+    if (group_of(i) < groups) {
+      *reinterpret_cast<uint4*>(qr + group_of(i) * kConvRotGroup + 16 * h) = packed;
+      if constexpr (kNorm) {
+        const auto* words = reinterpret_cast<const int*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) squared = __dp4a(words[j], words[j], squared);
+      }
+    }
   }
+  if constexpr (kNorm) {
+    for (int d = 16; d > 0; d /= 2) squared += __shfl_down_sync(0xffffffffu, squared, d);
+    if (lane == 0) warp_norm[warp] = squared;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      unsigned total = 0;
+      for (int w = 0; w < warps; ++w) total += warp_norm[w];
+      a.squared_norm[row] = total;
+    }
+  }
+}
+
+__global__ void row_norms_kernel(const std::int8_t* x, std::int64_t rows, int k, std::int64_t ld,
+                                std::uint32_t* out) {
+  const int lane = threadIdx.x % 32;
+  const std::int64_t row = std::int64_t(blockIdx.x) * 8 + threadIdx.x / 32;
+  if (row >= rows) return;
+  const auto* packed = reinterpret_cast<const int*>(x + row * ld);
+  int sum = 0;
+  for (int i = lane; i < k / 4; i += 32) { const int v = packed[i]; sum = __dp4a(v, v, sum); }
+  for (int d = 16; d > 0; d /= 2) sum += __shfl_down_sync(0xffffffffu, sum, d);
+  if (lane == 0) out[row] = sum;
 }
 
 // Pairs of groups per warp and warps per block for a row of `groups` groups: at most 8 warps while 4 pairs per warp
@@ -229,7 +261,7 @@ BlockShape block_shape(int groups) {
   return {4, (pairs + 3) / 4};
 }
 
-template <int kVT, bool kStoreY = false>
+template <int kVT, bool kStoreY = false, bool kNorm = false>
 void launch_rows(const char* op, const RotateArgs& a, std::int64_t m, cudaStream_t stream) {
   const BlockShape bs = block_shape(a.k / kConvRotGroup);
   if (bs.warps > kMaxWarps) fail(op, "row too long");
@@ -237,9 +269,9 @@ void launch_rows(const char* op, const RotateArgs& a, std::int64_t m, cudaStream
   const dim3 grid(static_cast<unsigned>(m)), block(static_cast<unsigned>(32 * bs.warps));
   const std::size_t smem = sizeof(float) * 2 * kHalfFloats * static_cast<std::size_t>(bs.warps);  // <= 35 KB
   switch (bs.pairs_per_warp) {
-    case 1: rotate_quantize_kernel<1, kVT, kStoreY><<<grid, block, smem, stream>>>(a); break;
-    case 2: rotate_quantize_kernel<2, kVT, kStoreY><<<grid, block, smem, stream>>>(a); break;
-    default: rotate_quantize_kernel<4, kVT, kStoreY><<<grid, block, smem, stream>>>(a); break;
+    case 1: rotate_quantize_kernel<1, kVT, kStoreY, kNorm><<<grid, block, smem, stream>>>(a); break;
+    case 2: rotate_quantize_kernel<2, kVT, kStoreY, kNorm><<<grid, block, smem, stream>>>(a); break;
+    default: rotate_quantize_kernel<4, kVT, kStoreY, kNorm><<<grid, block, smem, stream>>>(a); break;
   }
   MI_CUDA_CHECK_LAUNCH();
 }
@@ -270,18 +302,31 @@ RotateArgs check_rotate(const char* op, const __nv_bfloat16* x, std::int64_t ldx
 
 }  // namespace
 
+void int8_row_norms(const std::int8_t* x, std::int64_t rows, std::int64_t k, std::int64_t ld,
+                    std::uint32_t* out, cudaStream_t stream) {
+  if (rows < 0 || rows > 0x7fffffff || k <= 0 || k > kMaxInt8GemmK || k % 4 != 0 || ld < k || ld % 4 != 0 ||
+      reinterpret_cast<std::uintptr_t>(x) % 4 != 0 || reinterpret_cast<std::uintptr_t>(out) % 4 != 0 ||
+      (rows > 0 && (!x || !out))) throw std::invalid_argument("quant::int8_row_norms: invalid operands");
+  if (!rows) return;
+  row_norms_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(x, rows, k, ld, out);
+  MI_CUDA_CHECK_LAUNCH();
+}
+
 void rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, std::int8_t* q, std::int64_t ldq, float* scale,
-                     std::int64_t m, int k, cudaStream_t stream) {
+                     std::int64_t m, int k, cudaStream_t stream, std::uint32_t* squared_norm) {
   constexpr const char* op = "quant::rotate_quantize";
-  const RotateArgs a = check_rotate(op, x, ldx, q, ldq, scale, m, k);
+  RotateArgs a = check_rotate(op, x, ldx, q, ldq, scale, m, k);
+  if (!aligned(squared_norm, 4)) fail(op, "squared_norm must be 4-byte aligned");
+  a.squared_norm = squared_norm;
   if (m == 0) return;
-  launch_rows<0>(op, a, m, stream);
+  if (squared_norm) launch_rows<0, false, true>(op, a, m, stream);
+  else launch_rows<0>(op, a, m, stream);
 }
 
 void rms_norm_modulate_rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, const __nv_bfloat16* norm_weight,
                                        const __nv_bfloat16* mod_scale, const __nv_bfloat16* mod_shift, std::int8_t* q,
                                        std::int64_t ldq, float* scale, std::int64_t m, int k, cudaStream_t stream,
-                                       __nv_bfloat16* y, std::int64_t ldy) {
+                                       __nv_bfloat16* y, std::int64_t ldy, std::uint32_t* squared_norm) {
   constexpr const char* op = "quant::rms_norm_modulate_rotate_quantize";
   RotateArgs a = check_rotate(op, x, ldx, q, ldq, scale, m, k);
   if (!aligned(norm_weight, 16) || !aligned(mod_scale, 16) || !aligned(mod_shift, 16) || norm_weight == nullptr ||
@@ -291,6 +336,8 @@ void rms_norm_modulate_rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx,
   if (y != nullptr && (!aligned(y, 16) || ldy < k || ldy % 8 != 0)) {
     fail(op, "y must be 16-byte aligned with ldy >= k and ldy % 8 == 0 (ldy " + std::to_string(ldy) + ")");
   }
+  if (!aligned(squared_norm, 4)) fail(op, "squared_norm must be 4-byte aligned");
+  a.squared_norm = squared_norm;
   a.y = y;
   a.ldy = ldy;
   if (m == 0) return;
@@ -299,20 +346,23 @@ void rms_norm_modulate_rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx,
   a.mod_scale = mod_scale;
   a.mod_shift = mod_shift;
   a.factor = static_cast<float>(m) / static_cast<float>(m * k);
-  const auto launch = [&](auto store_y) {
+  const auto launch = [&](auto store_y, auto norms) {
+    constexpr bool kNorm = decltype(norms)::value;
     constexpr bool kY = decltype(store_y)::value;
     switch (bw) {
-      case 32: launch_rows<1, kY>(op, a, m, stream); break;
-      case 64: launch_rows<2, kY>(op, a, m, stream); break;
-      case 128: launch_rows<4, kY>(op, a, m, stream); break;
-      case 256: launch_rows<8, kY>(op, a, m, stream); break;
-      default: launch_rows<16, kY>(op, a, m, stream); break;
+      case 32: launch_rows<1, kY, kNorm>(op, a, m, stream); break;
+      case 64: launch_rows<2, kY, kNorm>(op, a, m, stream); break;
+      case 128: launch_rows<4, kY, kNorm>(op, a, m, stream); break;
+      case 256: launch_rows<8, kY, kNorm>(op, a, m, stream); break;
+      default: launch_rows<16, kY, kNorm>(op, a, m, stream); break;
     }
   };
   if (y != nullptr) {
-    launch(std::true_type{});
+    if (squared_norm) launch(std::true_type{}, std::true_type{});
+    else launch(std::true_type{}, std::false_type{});
   } else {
-    launch(std::false_type{});
+    if (squared_norm) launch(std::false_type{}, std::true_type{});
+    else launch(std::false_type{}, std::false_type{});
   }
 }
 

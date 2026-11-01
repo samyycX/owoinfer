@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "core/cuda_check.h"
+#include "kernels/sm70/sm70.h"
 #include "kernels/sm75/sm75.h"
 #include "models/moss_dit/moss_dit.h"
 #include "weights/quant/nvfp4_codec.h"
@@ -382,12 +383,28 @@ std::size_t BlockWeights::block_device_bytes(const weights::ModelIndex& index) {
   return bytes;
 }
 
+namespace {
+// Upper bound from stored I8 matrices (includes INT4 matrices, which do not consume the optional metadata).
+std::size_t int8_norm_bytes(const WeightGroup& group) {
+  if (!kernels::sm70::volta()) return 0;
+  std::size_t bytes = 0;
+  for (const auto& t : group.tensors) {
+    if (t.dtype == weights::DType::kI8 && t.shape.size() == 2 && t.name.ends_with(".weight")) {
+      bytes += runtime::align_up(static_cast<std::size_t>(t.shape[0]) * sizeof(std::uint32_t));
+    }
+  }
+  return bytes;
+}
+}  // namespace
+
 std::size_t BlockWeights::resident_bytes(const weights::ModelIndex& index, const Residency& residency) {
   check_residency(residency);
   const auto mask = resident_mask(residency.resident_blocks);
   std::size_t total = 0;
   for (int i = 0; i < kNumBlocks; ++i) {
-    if (mask.test(static_cast<std::size_t>(i))) total += weights::group_device_bytes(block_group(index, i));
+    if (mask.test(static_cast<std::size_t>(i))) {
+      total += weights::group_device_bytes(block_group(index, i)) + int8_norm_bytes(block_group(index, i));
+    }
   }
   return total;
 }
@@ -430,7 +447,14 @@ BlockWeights::BlockWeights(const weights::ModelIndex& index, runtime::DeviceAren
     for (int i = 0; i < kNumBlocks; ++i) {
       ordered_.push_back(detail::with_front(block_group(index, i), detail::block_front(i, quant)));
       if (resident(i)) {
-        resident_[static_cast<std::size_t>(i)] = make_views(i, upload(ordered_.back()));
+        auto& b = resident_[static_cast<std::size_t>(i)];
+        b = make_views(i, upload(ordered_.back()));
+        if (kernels::sm70::volta()) {
+          for (Int8Linear* l : {&b.qkv8, &b.o8, &b.up_gate8, &b.down8,
+                               &b.qkv8_part[0], &b.qkv8_part[1], &b.qkv8_part[2]}) {
+            if (!l->empty()) l->squared_norm = arena.alloc_persistent_tensor(DType::kI32, {l->w.dim(0)});
+          }
+        }
         continue;
       }
       if (before_group) before_group(ordered_.back());
@@ -480,6 +504,20 @@ void BlockWeights::convert_weights_to_f16(cudaStream_t stream) {
     if (!resident(i)) continue;
     convert_block_to_f16(resident_[static_cast<std::size_t>(i)], stream);
   }
+}
+
+void BlockWeights::refresh_int8_norms(cudaStream_t stream) {
+#if MOSSINFER_HAVE_SM70
+  for (auto& b : resident_) {
+    for (Int8Linear* l : {&b.qkv8, &b.o8, &b.up_gate8, &b.down8,
+                         &b.qkv8_part[0], &b.qkv8_part[1], &b.qkv8_part[2]}) {
+      if (l->squared_norm.data) kernels::quant::int8_row_norms(l->w.ptr<std::int8_t>(), l->w.dim(0), l->w.dim(1),
+                                                           l->w.dim(1), l->squared_norm.ptr<std::uint32_t>(), stream);
+    }
+  }
+#else
+  (void)stream;
+#endif
 }
 
 void BlockWeights::create_streaming_resources() {

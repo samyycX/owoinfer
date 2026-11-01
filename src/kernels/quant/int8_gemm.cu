@@ -69,6 +69,10 @@ Problem check_operands(const char* op, const Int8Operands& a) {
   if (a.norm_bounds != nullptr && reinterpret_cast<std::uintptr_t>(a.norm_bounds) % 8 != 0) {
     fail(op, "norm_bounds must be 8-byte aligned");
   }
+  if ((a.x_norm == nullptr) != (a.w_norm == nullptr) || reinterpret_cast<std::uintptr_t>(a.x_norm) % 4 != 0 ||
+      reinterpret_cast<std::uintptr_t>(a.w_norm) % 4 != 0) {
+    fail(op, "x_norm and w_norm must be supplied together and be 4-byte aligned");
+  }
   Problem p;
   p.m = static_cast<int>(a.m);
   p.n = static_cast<int>(a.n);

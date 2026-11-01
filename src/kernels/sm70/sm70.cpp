@@ -4,6 +4,11 @@
 
 namespace mi::kernels::sm70 {
 
+std::size_t flash_fwd_preconvert_bytes(std::int64_t total_q, std::int64_t total_k, int heads, int kv_heads) {
+  const auto lse = (static_cast<std::size_t>(total_q) * heads * sizeof(float) + 15) / 16 * 16;
+  return lse + 2 * static_cast<std::size_t>(total_k) * kv_heads * 128 * sizeof(std::uint16_t);
+}
+
 bool available() {
 #if MOSSINFER_HAVE_SM70
   return true;
